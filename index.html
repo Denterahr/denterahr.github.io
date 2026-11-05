@@ -389,6 +389,9 @@ tr.future td{color:var(--ink-faint)}
 .act-cell{white-space:nowrap}
 .btn.danger-txt{color:var(--danger)}
 .btn.danger-txt:hover{border-color:var(--danger)}
+
+/* attendance dashboard frame */
+.att-frame{display:block;width:100%;min-height:520px;border:1px solid var(--border);border-radius:12px;background:var(--bg)}
 </style></head><body><div id="root" dir="rtl"></div><script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script><script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script><script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script><script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script><script id="lib-src">/* ============================================================
    Dentera HR Dashboard — client-side workbook extraction
    Mirrors /home/claude/build/extract.py exactly (same rules,
@@ -1194,6 +1197,8 @@ function sanitizeForHr(d){
       return o;
     });
   });
+  /* attendance records (names, employee numbers, daily check-in times, leave) are HR data: kept as they are */
+  if(d && d.attendance && typeof d.attendance === 'object' && !Array.isArray(d.attendance)) out.attendance = d.attendance;
   return out;
 }
 
@@ -1222,10 +1227,384 @@ function buildFinance(d, todayISO){
 global.SiteReport = { buildReport: buildReport, buildPublic: buildPublic, buildFinance: buildFinance, sanitizeForHr: sanitizeForHr, HR_STRIP: HR_STRIP,
   ymOf: ymOf, ymAdd: ymAdd, ymRange: ymRange, ymLabel: ymLabel, reasonGroup: reasonGroup, AR_MONTHS: AR_MONTHS };
 })(typeof window !== 'undefined' ? window : globalThis);
+
+;
+(function(global){
+// Attendance workbook parser — mirrors the Python extraction logic.
+// Works against a SheetJS workbook object (global XLSX must be loaded first).
+
+const STATUS_MAP = {
+  'غياب': 'absent',
+  'اوف': 'off',
+  'أوف': 'off',
+  'اجازة تحت الموافقة': 'leave_pending',
+  'إجازة تحت الموافقة': 'leave_pending',
+  'في اجازة سنوية': 'leave_annual',
+  'في إجازة سنوية': 'leave_annual',
+  'اجازة سنوية': 'leave_annual',
+  'اجازة مرضية': 'leave_sick',
+  'إجازة مرضية': 'leave_sick',
+  'في اجازة مرض': 'leave_sick',
+  'في إجازة مرض': 'leave_sick',
+  'اخرى': 'other',
+  'أخرى': 'other',
+};
+
+const STATUS_LABELS_AR = {
+  present: 'حاضر',
+  missing_checkout: 'دوام بدون بصمة انصراف',
+  absent: 'غياب',
+  off: 'اوف (يوم راحة)',
+  leave_pending: 'اجازة تحت الموافقة',
+  leave_annual: 'اجازة سنوية',
+  leave_sick: 'اجازة مرضية',
+  other: 'أخرى',
+  no_show: 'لم يسجل حضور',
+  unknown: 'غير محدد',
+};
+
+const DEPT_CANON = {
+  'الاشعة': 'الأشعة',
+  'اشعة': 'الأشعة',
+  'مركز الاتصال': 'خدمة العملاء',
+};
+
+function normArDept(raw) {
+  if (!raw) return raw;
+  let s = String(raw).trim();
+  if (DEPT_CANON[s]) return DEPT_CANON[s];
+  return s;
+}
+
+function isEmployeeHeader(cellStr) {
+  return /^\d{3,6}\s*-?\s*/.test(cellStr);
+}
+
+function parseEmpHeader(cellStr) {
+  const s = String(cellStr).trim();
+  const m = s.match(/^(\d{3,6})\s*-?\s*(.+)$/);
+  if (m) return { id: m[1], name: m[2].trim() };
+  return { id: null, name: s };
+}
+
+function isTimePattern(s) {
+  return /^\d{1,2}:\d{2}\s*(AM|PM)/i.test(String(s).trim());
+}
+
+function sheetDateFromName(sheetName) {
+  const m = String(sheetName).trim().match(/^(\d{2})(\d{2})(\d{4})/);
+  if (!m) return null;
+  const [, d, mo, y] = m;
+  return `${y}-${mo}-${d}`;
+}
+
+// Parse one daily sheet (2-row-per-employee blocks, grouped by department header rows)
+function parseDailySheet(rows, dateStr) {
+  const records = [];
+  const employees = {}; // id -> {name, department}
+  let dept = null;
+  let r = 0;
+  while (r < rows.length) {
+    const row = rows[r] || [];
+    const a = row[0];
+    if (a === null || a === undefined || a === '') { r++; continue; }
+    const aStr = String(a).trim();
+    if (aStr === 'التاريخ') { r++; continue; } // table header row
+    if (!isEmployeeHeader(aStr)) {
+      dept = normArDept(aStr);
+      r++;
+      continue;
+    }
+    const { id, name } = parseEmpHeader(aStr);
+    r++;
+    if (r >= rows.length) break;
+    const dataRow = rows[r] || [];
+    const period = dataRow[1];
+    const checkin = dataRow[2] || null;
+    const checkout = dataRow[3] || null;
+    const duration = dataRow[4] || null;
+    const perm = dataRow[5] || null;
+    const note = dataRow[6] || null;
+    r++;
+
+    if (id) {
+      if (!employees[id]) employees[id] = { name, department: dept };
+      else if (!employees[id].department && dept) employees[id].department = dept;
+    }
+
+    let status = null;
+    let timepat = false;
+    if (typeof period === 'string') {
+      const p = period.trim();
+      if (isTimePattern(p)) timepat = true;
+      else if (STATUS_MAP[p]) status = STATUS_MAP[p];
+      else status = 'other';
+    }
+    if (timepat) {
+      if (checkin && checkout) status = 'present';
+      else if (checkin && !checkout) status = 'missing_checkout';
+      else status = 'no_show';
+    } else if (status === null) {
+      status = 'unknown';
+    }
+
+    if (id && dateStr) {
+      records.push({
+        id, date: dateStr, dept,
+        status,
+        shift: timepat ? period : null,
+        ci: checkin, co: checkout, dur: duration,
+        note: note || null,
+      });
+    }
+  }
+  return { employees, records };
+}
+
+const SUMMARY_STATUS_MAP = {
+  'غياب': 'absent',
+  'اجازة تحت الموافقة': 'leave_pending',
+  'إجازة تحت الموافقة': 'leave_pending',
+  'اجازة مرضية': 'leave_sick',
+  'إجازة مرضية': 'leave_sick',
+  'في اجازة سنوية': 'leave_annual',
+  'في إجازة سنوية': 'leave_annual',
+  'اجازة سنوية': 'leave_annual',
+  'إجازة سنوية': 'leave_annual',
+  'اخرى': 'other',
+  'أخرى': 'other',
+};
+
+// Parse the summary/"absence matrix" sheet: one row per employee, dept header rows interspersed,
+// date columns in pairs (status, note) starting at column index 1 (0-based), keyed by header row.
+function parseSummarySheet(rows, knownDates) {
+  // find header row: first row containing a "MM/DD"-ish value in col>=1 with many pairs
+  let headerRowIdx = -1;
+  for (let i = 0; i < Math.min(rows.length, 6); i++) {
+    const row = rows[i] || [];
+    if (row.length > 5 && typeof row[1] === 'string') { headerRowIdx = i; break; }
+  }
+  if (headerRowIdx === -1) return { roster: {}, leaveLog: [] };
+
+  const headerRow = rows[headerRowIdx];
+  // build MM/DD -> full date lookup from knownDates (array of 'YYYY-MM-DD')
+  const mmddToFull = {};
+  (knownDates || []).forEach(d => {
+    const [y, mo, da] = d.split('-');
+    mmddToFull[`${mo}/${da}`] = d;
+  });
+  const dateCols = {}; // colIndex -> full date string
+  for (let c = 1; c < headerRow.length; c += 2) {
+    const v = headerRow[c];
+    if (v === null || v === undefined || v === '') continue;
+    const s = String(v).trim();
+    let full = mmddToFull[s];
+    if (!full) {
+      // try to parse "YYYY-MM-DD" or "MM/DD/YYYY" style directly
+      const m1 = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (m1) full = s.slice(0, 10);
+    }
+    if (full) dateCols[c] = full;
+  }
+
+  // Some columns in the header row are a "MM/DD" placeholder for a day that has
+  // no matching daily check-in/out sheet yet in THIS workbook (e.g. today's leave
+  // status entered in advance, before the day's attendance sheet is exported).
+  // mmddToFull only covers days this workbook already has a daily sheet for, so
+  // fall back to inferring the year from the most recent known date rather than
+  // silently dropping such a column.
+  const sortedKnown = (knownDates || []).slice().sort();
+  const lastKnown = sortedKnown[sortedKnown.length - 1];
+  for (let c = 1; c < headerRow.length; c += 2) {
+    if (dateCols[c]) continue;
+    const v = headerRow[c];
+    if (v === null || v === undefined || v === '') continue;
+    const s = String(v).trim();
+    const m2 = s.match(/^(\d{1,2})\/(\d{1,2})$/);
+    if (!m2) continue;
+    const [, mo, da] = m2;
+    let year = new Date().getFullYear();
+    if (lastKnown) {
+      const [lastY, lastMo] = lastKnown.split('-').map(Number);
+      year = lastY;
+      if (Number(mo) < lastMo - 6) year += 1; // month wrapped into the next year
+    }
+    dateCols[c] = `${year}-${mo.padStart(2, '0')}-${da.padStart(2, '0')}`;
+  }
+
+  const roster = {};
+  let dept = null;
+  for (let r = headerRowIdx + 2; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const a = row[0];
+    if (a === null || a === undefined || a === '') continue;
+    const aStr = String(a).trim();
+    if (aStr === 'اسم الموظف' || aStr.includes('متابعة الحضور')) continue;
+    if (!isEmployeeHeader(aStr)) { dept = normArDept(aStr); continue; }
+    const { id, name } = parseEmpHeader(aStr);
+    if (!id) continue;
+    const rec = { id, name, department: dept, summary_status: {} };
+    for (const [colIdx, fullDate] of Object.entries(dateCols)) {
+      const c = Number(colIdx);
+      const v = row[c];
+      const note = row[c + 1];
+      if (v) {
+        const s = String(v).trim();
+        const mapped = SUMMARY_STATUS_MAP[s] || 'other';
+        rec.summary_status[fullDate] = { status: mapped, raw: s, note: note || null };
+      }
+    }
+    roster[id] = rec;
+  }
+
+  const leaveLog = [];
+  Object.values(roster).forEach(e => {
+    Object.entries(e.summary_status).forEach(([date, info]) => {
+      leaveLog.push({ id: e.id, date, status: info.status, raw: info.raw, note: info.note });
+    });
+  });
+
+  return { roster, leaveLog };
+}
+
+// Main entry: takes a SheetJS workbook, returns the unified dataset shape used by the dashboard.
+function parseAttendanceWorkbook(wb) {
+  const sheetNames = wb.SheetNames;
+  const dailySheetNames = sheetNames.filter(n => /^\d{8}/.test(n.trim()));
+  const otherSheetNames = sheetNames.filter(n => !/^\d{8}/.test(n.trim()));
+
+  const dailyEmployees = {};
+  let allRecords = [];
+  const dailyDates = [];
+
+  dailySheetNames.forEach(sn => {
+    const dateStr = sheetDateFromName(sn);
+    if (!dateStr) return;
+    dailyDates.push(dateStr);
+    const ws = wb.Sheets[sn];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: null });
+    const { employees, records } = parseDailySheet(rows, dateStr);
+    Object.entries(employees).forEach(([id, e]) => {
+      if (!dailyEmployees[id]) dailyEmployees[id] = e;
+      else if (!dailyEmployees[id].department && e.department) dailyEmployees[id].department = e.department;
+    });
+    allRecords = allRecords.concat(records);
+  });
+  dailyDates.sort();
+
+  let summaryRoster = {};
+  let leaveLog = [];
+  // Some exports carry a stray duplicate/backup summary sheet (e.g. "نسخة من
+  // الغياب 1") alongside the real one — pick whichever "غياب" sheet actually
+  // covers the most dates (its header row 2 has the most non-empty cells)
+  // rather than just the first one by name/position, so a duplicate that is
+  // further behind never silently wins over the more current sheet.
+  const summaryCandidates = otherSheetNames.filter(n => n.includes('غياب'));
+  let summarySheetName = null;
+  if (summaryCandidates.length <= 1) {
+    summarySheetName = summaryCandidates[0] || otherSheetNames[0];
+  } else {
+    let bestCount = -1;
+    summaryCandidates.forEach(n => {
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: false, defval: null });
+      const headerRow = rows[1] || [];
+      const count = headerRow.filter(v => v !== null && v !== undefined && v !== '').length;
+      if (count > bestCount) { bestCount = count; summarySheetName = n; }
+    });
+  }
+  if (summarySheetName) {
+    const ws = wb.Sheets[summarySheetName];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: null });
+    const parsed = parseSummarySheet(rows, dailyDates);
+    summaryRoster = parsed.roster;
+    leaveLog = parsed.leaveLog;
+  }
+
+  // unify roster
+  const roster = {};
+  Object.entries(summaryRoster).forEach(([id, e]) => {
+    roster[id] = {
+      id, name: e.name,
+      department: normArDept(e.department),
+      tracked: !!dailyEmployees[id],
+    };
+  });
+  Object.entries(dailyEmployees).forEach(([id, e]) => {
+    if (!roster[id]) {
+      roster[id] = { id, name: e.name, department: normArDept(e.department), tracked: true };
+    } else {
+      roster[id].tracked = true;
+    }
+  });
+
+  return {
+    meta: {
+      generated: new Date().toISOString().slice(0, 10),
+      daily_date_range: dailyDates.length ? [dailyDates[0], dailyDates[dailyDates.length - 1]] : [null, null],
+      daily_dates: dailyDates,
+    },
+    roster: Object.values(roster),
+    records: allRecords,
+    leave_log: leaveLog,
+    status_labels: STATUS_LABELS_AR,
+  };
+}
+
+// Merge a freshly-parsed dataset ("newData") into a previously-loaded one
+// ("oldData"), both in the shape returned by parseAttendanceWorkbook (or the
+// equivalent currentDatasetPayload() shape used by the app: {meta, roster,
+// records, leave_log, status_labels}). Real-world exports from this HR system
+// are often a rolling window (e.g. "the last few days" rather than the full
+// history), so a plain replace on every update would silently discard older
+// days.
+//
+// This is deliberately ADDITIVE, never destructive: a date the old dataset
+// already has (a daily check-in/out sheet, or a leave/absence entry) is left
+// exactly as-is, and only dates the old dataset does NOT yet have are pulled
+// in from the new file. This matters because this workbook format has real
+// ambiguity a fresh re-parse can't safely resolve on its own (e.g. duplicate
+// "absence" summary sheets, occasional gaps for a given employee that a
+// person had to reconcile by hand) — so once a date's data has been loaded
+// and possibly hand-corrected, a later upload should only ever add new days,
+// never quietly re-derive and overwrite ones already in place. Likewise for
+// the roster: an existing employee's name/department is left untouched (it
+// may have been corrected by hand), and only employee ids the old roster
+// doesn't have at all are added.
+function mergeAttendanceDatasets(oldData, newData) {
+  const oldDailyDates = new Set((oldData.meta && oldData.meta.daily_dates) || []);
+  const oldLeaveDates = new Set((oldData.leave_log || []).map(l => l.date));
+  const oldIds = new Set((oldData.roster || []).map(e => e.id));
+
+  const newRecordsToAdd = (newData.records || []).filter(r => !oldDailyDates.has(r.date));
+  const newLeaveToAdd = (newData.leave_log || []).filter(l => !oldLeaveDates.has(l.date));
+  const newRosterToAdd = (newData.roster || []).filter(e => !oldIds.has(e.id));
+
+  const mergedDailyDates = Array.from(new Set([
+    ...oldDailyDates,
+    ...new Set(newRecordsToAdd.map(r => r.date)),
+  ])).sort();
+
+  return {
+    meta: {
+      generated: new Date().toISOString().slice(0, 10),
+      daily_date_range: mergedDailyDates.length ? [mergedDailyDates[0], mergedDailyDates[mergedDailyDates.length - 1]] : [null, null],
+      daily_dates: mergedDailyDates,
+    },
+    roster: (oldData.roster || []).concat(newRosterToAdd),
+    records: (oldData.records || []).concat(newRecordsToAdd),
+    leave_log: (oldData.leave_log || []).concat(newLeaveToAdd),
+    status_labels: (oldData.status_labels || newData.status_labels || STATUS_LABELS_AR),
+  };
+}
+
+
+global.DenteraAttendance = { parse: parseAttendanceWorkbook, merge: mergeAttendanceDatasets, LABELS: STATUS_LABELS_AR };
+})(typeof window !== "undefined" ? window : globalThis);
 </script><script id="app-src">(function(){
 "use strict";
 var LOGO = "data:image/png;base64,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";
 var FIREBASE_CONFIG = {"apiKey": "AIzaSyCJ7lYN1tPUYqTFk64elRJJ5v6KsEnyVic", "authDomain": "dentera-hr.firebaseapp.com", "projectId": "dentera-hr", "storageBucket": "dentera-hr.firebasestorage.app", "messagingSenderId": "1047691372019", "appId": "1:1047691372019:web:cf8ff07d8e8445b1915e86"};
+var ATT_FRAME_HTML = "<!doctype html><html lang=\"ar\" dir=\"rtl\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap\"><style>  :root {\n    color-scheme: light;\n    --page: #f9f9f7;\n    --surface-1: #ffffff;\n    --surface-2: #fcfcfb;\n    --ink-1: #14181c;\n    --ink-2: #52514e;\n    --ink-muted: #898781;\n    --grid: #e6e4dd;\n    --baseline: #c3c2b7;\n    --border: rgba(11,11,11,0.10);\n    --accent: #078295;\n    --accent-2: #056272;\n    --accent-soft: #e2f6f8;\n    --accent-ink: #ffffff;\n    --brand-navy: #141868;\n    --good: #0ca30c;\n    --good-soft: #e5f6e5;\n    --warn: #b9780a;\n    --warn-soft: #fdf1da;\n    --crit: #d03b3b;\n    --crit-soft: #fbe8e8;\n    --leave: #4a3aa7;\n    --leave-soft: #ece9f9;\n    --off: #6b6a65;\n    --off-soft: #ecebe7;\n    --shadow: 0 1px 2px rgba(20,24,28,0.04), 0 8px 24px -12px rgba(20,24,28,0.18);\n    --radius: 14px;\n  }\n  @media (prefers-color-scheme: dark) {\n    :root:not([data-theme=\"light\"]) {\n      color-scheme: dark;\n      --page: #0d0d0d;\n      --surface-1: #1a1a19;\n      --surface-2: #1f1f1e;\n      --ink-1: #f5f5f3;\n      --ink-2: #c3c2b7;\n      --ink-muted: #8f8d87;\n      --grid: #2c2c2a;\n      --baseline: #383835;\n      --border: rgba(255,255,255,0.10);\n      --accent: #0cb8ce;\n      --accent-2: #3dd3e6;\n      --accent-soft: #103238;\n      --accent-ink: #141868;\n      --brand-navy: #eef0ff;\n      --good: #0ca30c;\n      --good-soft: #133316;\n      --warn: #fab219;\n      --warn-soft: #3a2c0c;\n      --crit: #e66767;\n      --crit-soft: #3a1414;\n      --leave: #9085e9;\n      --leave-soft: #241f3f;\n      --off: #a3a199;\n      --off-soft: #26251f;\n      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);\n    }\n  }\n  :root[data-theme=\"dark\"] {\n    color-scheme: dark;\n    --page: #0d0d0d;\n    --surface-1: #1a1a19;\n    --surface-2: #1f1f1e;\n    --ink-1: #f5f5f3;\n    --ink-2: #c3c2b7;\n    --ink-muted: #8f8d87;\n    --grid: #2c2c2a;\n    --baseline: #383835;\n    --border: rgba(255,255,255,0.10);\n    --accent: #0cb8ce;\n    --accent-2: #3dd3e6;\n    --accent-soft: #103238;\n    --accent-ink: #141868;\n    --brand-navy: #eef0ff;\n    --good: #0ca30c;\n    --good-soft: #133316;\n    --warn: #fab219;\n    --warn-soft: #3a2c0c;\n    --crit: #e66767;\n    --crit-soft: #3a1414;\n    --leave: #9085e9;\n    --leave-soft: #241f3f;\n    --off: #a3a199;\n    --off-soft: #26251f;\n    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);\n  }\n\n  * { box-sizing: border-box; }\n  [hidden] { display: none !important; }\n  body {\n    background: var(--page);\n    color: var(--ink-1);\n    font-family: 'Tajawal', 'Segoe UI', system-ui, -apple-system, sans-serif;\n    font-variant-numeric: tabular-nums;\n  }\n  #app { direction: rtl; }\n  #app, #app * { line-height: 1.5; }\n  h1,h2,h3 { text-wrap: balance; margin: 0; }\n  button { font-family: inherit; }\n\n  .header {\n    position: sticky; top: env(safe-area-inset-top, 0px); z-index: 30;\n    background: var(--surface-1); border-bottom: 1px solid var(--border);\n    padding: 14px 20px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;\n  }\n  .brand { display: flex; align-items: center; gap: 12px; }\n  .brand-logo-badge {\n    background: #ffffff; border-radius: 10px; padding: 5px 12px; display: flex; align-items: center;\n    border: 1px solid var(--border); box-shadow: var(--shadow);\n  }\n  .brand-logo { height: 30px; width: auto; display: block; }\n  .brand-text { display: flex; flex-direction: column; gap: 2px; }\n  .brand-title { font-weight: 800; font-size: 17px; color: var(--brand-navy); }\n  .brand-sub { font-size: 12px; color: var(--ink-muted); }\n  .header-spacer { flex: 1; }\n\n  .search-wrap { position: relative; width: min(340px, 45vw); }\n  .search-input {\n    width: 100%; padding: 9px 14px; border-radius: 999px; border: 1px solid var(--border);\n    background: var(--surface-2); color: var(--ink-1); font-size: 14px; outline: none;\n  }\n  .search-input:focus { border-color: var(--accent); }\n  .search-drop {\n    position: absolute; inset-inline: 0; top: calc(100% + 6px); background: var(--surface-1);\n    border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; z-index: 40;\n  }\n  .search-item { display: flex; justify-content: space-between; gap: 10px; width: 100%; padding: 10px 14px; background: none; border: 0; color: var(--ink-1); text-align: right; cursor: pointer; font-size: 13.5px; }\n  .search-item:hover { background: var(--surface-2); }\n  .search-item-dept { color: var(--ink-muted); font-size: 12px; }\n\n  .btn { border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); color: var(--ink-1); padding: 9px 16px; font-size: 13.5px; font-weight: 700; cursor: pointer; }\n  .btn:hover { background: var(--accent-soft); }\n  .btn-primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 800; }\n  .btn-primary:hover { background: var(--accent-2); }\n\n  .tabs { display: flex; gap: 4px; padding: 0 20px; background: var(--surface-1); border-bottom: 1px solid var(--border); overflow-x: auto; position: sticky; top: 61px; z-index: 25; }\n  .tab-btn { padding: 12px 16px; background: none; border: 0; border-bottom: 2px solid transparent; color: var(--ink-muted); font-weight: 700; font-size: 13.5px; cursor: pointer; white-space: nowrap; }\n  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }\n\n  main { max-width: 1180px; margin: 0 auto; padding: 20px 20px 64px; }\n  .tab-panel[hidden] { display: none; }\n\n  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }\n  .kpi { background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; box-shadow: var(--shadow); }\n  .kpi-label { font-size: 12px; color: var(--ink-muted); margin-bottom: 8px; }\n  .kpi-value { font-size: 26px; font-weight: 800; }\n  .kpi-sub { font-size: 12px; color: var(--ink-2); margin-top: 4px; }\n\n  .grid-2 { display: grid; grid-template-columns: 1.1fr 1fr; gap: 16px; }\n  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; box-shadow: var(--shadow); }\n  .card-title { font-weight: 800; font-size: 15px; margin-bottom: 4px; }\n  .card-note { font-size: 12px; color: var(--ink-muted); margin-bottom: 14px; }\n  .card-body-scroll { overflow-x: auto; }\n\n  .dept-chart { width: 100%; height: auto; }\n  .dept-label { font-size: 11.5px; fill: var(--ink-2); }\n  .dept-value { font-size: 12px; fill: var(--ink-1); font-weight: 700; }\n  .dept-track { fill: var(--surface-2); }\n  .dept-bar { fill: var(--accent); }\n  .dept-row:hover .dept-bar { fill: var(--accent-2); }\n\n  .trend-chart { width: 100%; height: auto; }\n  .trend-ylabel, .trend-xlabel { font-size: 10px; fill: var(--ink-muted); }\n  .grid-line { stroke: var(--grid); stroke-width: 1; }\n  .trend-seg { transition: opacity .15s; }\n  .trend-bar:hover .trend-seg { opacity: 0.8; }\n  .trend-hit { cursor: pointer; }\n  .legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; font-size: 12px; color: var(--ink-2); }\n  .legend-item { display: flex; align-items: center; gap: 6px; }\n  .legend-dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }\n\n  #tooltip { position: fixed; z-index: 100; background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); padding: 10px 12px; font-size: 12.5px; pointer-events: none; min-width: 150px; }\n  .tip-title { font-weight: 800; margin-bottom: 6px; }\n  .tip-row { display: flex; align-items: center; gap: 6px; justify-content: space-between; padding: 2px 0; }\n  .tip-dot { width: 8px; height: 8px; border-radius: 2px; display: inline-block; margin-inline-end: 4px; }\n\n  .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }\n  .select { padding: 8px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); color: var(--ink-1); font-size: 13px; }\n  .icon-btn { width: 32px; height: 32px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--ink-1); cursor: pointer; font-size: 15px; }\n  .count-note { font-size: 12.5px; color: var(--ink-muted); margin-inline-start: auto; }\n\n  .chips-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }\n  .chip { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px; font-size: 13px; font-weight: 700; }\n  .chip-present { background: var(--good-soft); color: var(--good); }\n  .chip-leave { background: var(--leave-soft); color: var(--leave); }\n  .chip-absent { background: var(--crit-soft); color: var(--crit); }\n  .chip-off { background: var(--off-soft); color: var(--off); }\n  .chip-other { background: var(--warn-soft); color: var(--warn); }\n\n  table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 640px; }\n  thead th { text-align: right; font-size: 11.5px; color: var(--ink-muted); font-weight: 700; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }\n  tbody td { padding: 9px 10px; border-bottom: 1px solid var(--grid); vertical-align: middle; }\n  tbody tr:hover { background: var(--surface-2); }\n  .cell-id { color: var(--ink-muted); font-size: 12px; }\n  .cell-note { color: var(--ink-2); font-size: 12.5px; max-width: 220px; }\n  .num { font-variant-numeric: tabular-nums; }\n  .empty-row { text-align: center; padding: 28px; color: var(--ink-muted); }\n\n  .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; white-space: nowrap; }\n  .pill-good { background: var(--good-soft); color: var(--good); }\n  .pill-warn { background: var(--warn-soft); color: var(--warn); }\n  .pill-crit { background: var(--crit-soft); color: var(--crit); }\n  .pill-leave { background: var(--leave-soft); color: var(--leave); }\n  .pill-off { background: var(--off-soft); color: var(--off); }\n\n  .mini-bar { display: flex; width: 110px; height: 8px; border-radius: 999px; overflow: hidden; background: var(--surface-2); }\n  .mini-bar span { display: block; height: 100%; }\n  .pct-cell { font-weight: 800; font-variant-numeric: tabular-nums; }\n  .pct-good { color: var(--good); }\n  .pct-warn { color: var(--warn); }\n  .pct-crit { color: var(--crit); }\n\n  .leave-layout { display: grid; grid-template-columns: 1fr 260px; gap: 16px; align-items: start; }\n  .top-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--grid); font-size: 12.5px; }\n  .top-name { flex: 1; font-weight: 700; }\n  .top-dept { color: var(--ink-muted); font-size: 11.5px; }\n  .top-n { color: var(--crit); }\n  .muted-note { color: var(--ink-muted); font-size: 12.5px; }\n\n  .dir-toolbar { margin-bottom: 14px; }\n  .dir-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }\n  .dir-card { text-align: right; background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; cursor: pointer; font-family: inherit; color: var(--ink-1); display: flex; flex-direction: column; gap: 6px; }\n  .dir-card:hover { border-color: var(--accent); background: var(--accent-soft); }\n  .dir-card-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }\n  .dir-name { font-weight: 700; font-size: 13.5px; }\n  .tag { font-size: 10.5px; padding: 3px 8px; border-radius: 999px; white-space: nowrap; }\n  .tag-tracked { background: var(--good-soft); color: var(--good); }\n  .tag-untracked { background: var(--off-soft); color: var(--off); }\n  .dir-card-bottom { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--ink-muted); }\n  .dir-flag { font-size: 11px; color: var(--warn); font-weight: 700; }\n\n  .modal-backdrop { position: fixed; inset: 0; background: rgba(10,10,10,0.5); z-index: 60; display: flex; align-items: center; justify-content: center; padding: 20px; }\n  .modal-open { overflow: hidden; }\n  .modal { background: var(--surface-1); border-radius: 18px; max-width: 620px; width: 100%; max-height: 84vh; overflow-y: auto; box-shadow: var(--shadow); }\n  .modal-head { display: flex; justify-content: space-between; align-items: flex-start; padding: 18px 20px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--surface-1); }\n  .modal-close { border: 0; background: var(--surface-2); width: 30px; height: 30px; border-radius: 999px; color: var(--ink-1); cursor: pointer; font-size: 15px; }\n  .modal-body { padding: 18px 20px; }\n\n  .profile-timeline { display: flex; flex-direction: column; }\n  .tl-row { display: grid; grid-template-columns: 100px 130px 130px 1fr; gap: 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--grid); font-size: 12.5px; }\n  .tl-date { color: var(--ink-2); }\n  .tl-time { font-variant-numeric: tabular-nums; color: var(--ink-2); font-size: 12px; }\n  .tl-note { color: var(--ink-muted); font-size: 12px; }\n\n  .update-body { display: grid; gap: 18px; }\n  .update-option { border: 1px dashed var(--border); border-radius: 12px; padding: 16px; }\n  .update-option h4 { margin: 0 0 6px; font-size: 14px; }\n  .update-option p { margin: 0 0 10px; font-size: 12.5px; color: var(--ink-2); }\n  #dropzone { border: 2px dashed var(--border); border-radius: 12px; padding: 22px; text-align: center; cursor: pointer; font-size: 13px; color: var(--ink-2); }\n  #dropzone.drag { border-color: var(--accent); background: var(--accent-soft); }\n  .update-preview { margin-top: 12px; background: var(--surface-2); border-radius: 10px; padding: 12px 14px; }\n  .preview-row { display: flex; justify-content: space-between; font-size: 12.5px; padding: 4px 0; }\n  .update-status { margin-top: 8px; font-size: 12.5px; padding: 8px 12px; border-radius: 8px; }\n  .update-status.ok { background: var(--good-soft); color: var(--good); }\n  .update-status.err { background: var(--crit-soft); color: var(--crit); }\n  .update-status.warn { background: var(--warn-soft); color: var(--warn); }\n  .update-meta { font-size: 12px; color: var(--ink-muted); margin-top: 4px; }\n  .sheets-steps { margin: 0 0 12px; padding-inline-start: 18px; font-size: 12.5px; color: var(--ink-2); display: flex; flex-direction: column; gap: 4px; }\n  .sheets-link-row { display: flex; gap: 8px; }\n  .sheets-link-row input { flex: 1; border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; font-size: 12.5px; background: var(--surface-1); color: var(--ink-1); font-family: inherit; }\n  .sheets-link-row input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }\n  .sheets-link-note { margin: 6px 0 0; font-size: 11.5px; color: var(--ink-muted); }\n\n  footer.foot { max-width: 1180px; margin: 0 auto; padding: 10px 20px 40px; color: var(--ink-muted); font-size: 11.5px; }\n\n  @media (max-width: 760px) {\n    .kpis { grid-template-columns: repeat(2, 1fr); }\n    .grid-2 { grid-template-columns: 1fr; }\n    .leave-layout { grid-template-columns: 1fr; }\n    .search-wrap { width: 100%; order: 3; }\n    .tl-row { grid-template-columns: 1fr 1fr; }\n  }\nhtml,body{margin:0;background:var(--page)}\nbody{font-family:'IBM Plex Sans Arabic','Tajawal','Segoe UI',system-ui,sans-serif}\nbody.embedded .brand,body.embedded .header-spacer{display:none}\nbody.embedded .header{position:static;padding:12px 16px}\nbody.embedded .search-wrap{width:min(460px,100%)}\nbody.embedded .tabs{top:0;padding:0 12px}\nbody.embedded main{max-width:none;padding:16px 16px 40px}\n<\/style><\/head><body class=\"embedded\"><div id=\"app\">\n  <header class=\"header\">\n    <div class=\"brand\">\n      <div class=\"brand-logo-badge\"><\/div>\n      <div class=\"brand-text\">\n        <div class=\"brand-title\">لوحة الحضور والإجازات<\/div>\n        <div class=\"brand-sub\">Dentera Dental Consultant Clinics<\/div>\n      <\/div>\n    <\/div>\n    <div class=\"header-spacer\"><\/div>\n    <div class=\"search-wrap\">\n      <input id=\"global-search\" class=\"search-input\" type=\"search\" placeholder=\"ابحثي بالاسم أو الرقم الوظيفي…\" autocomplete=\"off\">\n      <div id=\"search-drop\" class=\"search-drop\" hidden=\"\"><\/div>\n    <\/div>\n  <\/header>\n\n  <nav class=\"tabs\">\n    <button class=\"tab-btn active\" data-tab=\"overview\">نظرة عامة<\/button>\n    <button class=\"tab-btn\" data-tab=\"daily\">الحضور اليومي<\/button>\n    <button class=\"tab-btn\" data-tab=\"compliance\">الالتزام الشهري<\/button>\n    <button class=\"tab-btn\" data-tab=\"leave\">الإجازات والغياب<\/button>\n    <button class=\"tab-btn\" data-tab=\"directory\">الموظفون<\/button>\n  <\/nav>\n\n  <main>\n    \n    <section class=\"tab-panel\" data-panel=\"overview\">\n      <div id=\"kpis\" class=\"kpis\"><\/div>\n      <div class=\"grid-2\">\n        <div class=\"card\">\n          <div class=\"card-title\">توزيع الموظفين حسب الأقسام<\/div>\n          <div class=\"card-note\">إجمالي القوى العاملة عبر جميع الأقسام<\/div>\n          <div class=\"card-body-scroll\" id=\"dept-chart\"><\/div>\n        <\/div>\n        <div class=\"card\">\n          <div class=\"card-title\">اتجاه الحضور اليومي<\/div>\n          <div class=\"card-note\" id=\"range-note\"><\/div>\n          <div class=\"card-body-scroll\" id=\"trend-chart\"><\/div>\n          <div class=\"legend\">\n            <span class=\"legend-item\"><span class=\"legend-dot\" style=\"background:var(--good)\"><\/span>حاضر<\/span>\n            <span class=\"legend-item\"><span class=\"legend-dot\" style=\"background:var(--leave)\"><\/span>إجازة<\/span>\n            <span class=\"legend-item\"><span class=\"legend-dot\" style=\"background:var(--off)\"><\/span>اوف<\/span>\n            <span class=\"legend-item\"><span class=\"legend-dot\" style=\"background:var(--warn)\"><\/span>أخرى / بدون بصمة<\/span>\n            <span class=\"legend-item\"><span class=\"legend-dot\" style=\"background:var(--crit)\"><\/span>غياب<\/span>\n          <\/div>\n        <\/div>\n      <\/div>\n    <\/section>\n\n    \n    <section class=\"tab-panel\" data-panel=\"daily\" hidden=\"\">\n      <div class=\"toolbar\">\n        <button id=\"date-prev\" class=\"icon-btn\" aria-label=\"اليوم السابق\">‹<\/button>\n        <select id=\"date-select\" class=\"select\"><\/select>\n        <button id=\"date-next\" class=\"icon-btn\" aria-label=\"اليوم التالي\">›<\/button>\n        <span id=\"daily-count\" class=\"count-note\"><\/span>\n      <\/div>\n      <div id=\"daily-chips\" class=\"chips-row\"><\/div>\n      <div class=\"card\">\n        <div class=\"card-body-scroll\">\n          <table>\n            <thead><tr>\n              <th>الرقم<\/th><th>الاسم<\/th><th>القسم<\/th><th>الحالة<\/th><th>أول دخول<\/th><th>آخر خروج<\/th><th>ساعات العمل<\/th><th>ملاحظات<\/th>\n            <\/tr><\/thead>\n            <tbody id=\"daily-table-body\"><\/tbody>\n          <\/table>\n        <\/div>\n      <\/div>\n    <\/section>\n\n    \n    <section class=\"tab-panel\" data-panel=\"compliance\" hidden=\"\">\n      <div class=\"toolbar\">\n        <select id=\"compliance-month-select\" class=\"select\"><\/select>\n        <select id=\"compliance-dept-filter\" class=\"select\"><option value=\"\">كل الأقسام<\/option><\/select>\n        <span id=\"compliance-count\" class=\"count-note\"><\/span>\n      <\/div>\n      <div class=\"card-note\" id=\"compliance-rule-note\" style=\"margin-bottom:16px;\"><\/div>\n      <div id=\"compliance-kpis\" class=\"kpis\" style=\"margin-bottom:20px;\"><\/div>\n      <div class=\"card\">\n        <div class=\"card-title\">الالتزام حسب الموظف<\/div>\n        <div class=\"card-note\">الأقل التزاماً أولاً — الأقسام المرتبطة ببصمة الحضور اليومي فقط<\/div>\n        <div class=\"card-body-scroll\">\n          <table>\n            <thead><tr>\n              <th>الرقم<\/th><th>الاسم<\/th><th>القسم<\/th><th>أيام مجدولة<\/th><th>ملتزم<\/th><th>متأخر<\/th><th>غير مكتمل<\/th><th>غياب<\/th><th>التوزيع<\/th><th>نسبة الالتزام<\/th>\n            <\/tr><\/thead>\n            <tbody id=\"compliance-table-body\"><\/tbody>\n          <\/table>\n        <\/div>\n      <\/div>\n    <\/section>\n\n    \n    <section class=\"tab-panel\" data-panel=\"leave\" hidden=\"\">\n      <div class=\"toolbar\">\n        <select id=\"leave-dept-filter\" class=\"select\"><option value=\"\">كل الأقسام<\/option><\/select>\n        <select id=\"leave-group-filter\" class=\"select\">\n          <option value=\"\">كل الحالات<\/option>\n          <option value=\"leave\">إجازة<\/option>\n          <option value=\"absent\">غياب<\/option>\n          <option value=\"off\">اوف<\/option>\n          <option value=\"other\">أخرى / بدون بصمة<\/option>\n        <\/select>\n        <span id=\"leave-count\" class=\"count-note\"><\/span>\n      <\/div>\n      <div class=\"leave-layout\">\n        <div class=\"card\">\n          <div class=\"card-title\">سجل القيود<\/div>\n          <div class=\"card-note\">كل حالات الغياب والإجازة والاستثناءات المسجلة، الأحدث أولاً<\/div>\n          <div class=\"card-body-scroll\" style=\"max-height:520px; overflow-y:auto;\">\n            <table>\n              <thead><tr><th>التاريخ<\/th><th>الرقم<\/th><th>الاسم<\/th><th>القسم<\/th><th>الحالة<\/th><th>ملاحظات<\/th><\/tr><\/thead>\n              <tbody id=\"leave-table-body\"><\/tbody>\n            <\/table>\n          <\/div>\n        <\/div>\n        <div class=\"card\">\n          <div class=\"card-title\">الأكثر غياباً<\/div>\n          <div class=\"card-note\">أيام \"غياب\" أو \"لم يسجل حضور\" فقط — لا تشمل الإجازات المعتمدة<\/div>\n          <div id=\"leave-top\"><\/div>\n        <\/div>\n      <\/div>\n    <\/section>\n\n    \n    <section class=\"tab-panel\" data-panel=\"directory\" hidden=\"\">\n      <div class=\"toolbar dir-toolbar\">\n        <span id=\"dir-count\" class=\"count-note\" style=\"margin-inline-start:0\"><\/span>\n      <\/div>\n      <div id=\"dir-list\" class=\"dir-list\"><\/div>\n    <\/section>\n  <\/main>\n\n  <footer class=\"foot\" id=\"update-meta\"><\/footer>\n\n  <div id=\"tooltip\" hidden=\"\"><\/div>\n\n  \n  <div id=\"profile-modal\" class=\"modal-backdrop\" hidden=\"\">\n    <div class=\"modal\">\n      <div class=\"modal-head\">\n        <div>\n          <h3 id=\"profile-title\"><\/h3>\n          <div class=\"brand-sub\" id=\"profile-sub\"><\/div>\n        <\/div>\n        <button id=\"profile-close\" class=\"modal-close\" aria-label=\"إغلاق\">✕<\/button>\n      <\/div>\n      <div class=\"modal-body\" id=\"profile-body\"><\/div>\n    <\/div>\n  <\/div>\n<\/div><script>/* Dentera attendance dashboard — app logic */\n(function () {\n  'use strict';\n\n  /* ---------------- utilities ---------------- */\n  function esc(s) {\n    if (s === null || s === undefined) return '';\n    return String(s).replace(/[&<>\"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\n  }\n  function stripArabicDiacritics(s) {\n    let out = '';\n    for (const ch of s) {\n      const c = ch.codePointAt(0);\n      if (c >= 0x064B && c <= 0x065F) continue; // Arabic combining diacritics\n      out += ch;\n    }\n    return out;\n  }\n  function normAr(s) {\n    if (!s) return '';\n    return stripArabicDiacritics(\n      String(s).trim().toLowerCase()\n        .replace(/[إأآا]/g, 'ا')\n        .replace(/ة/g, 'ه')\n        .replace(/ى/g, 'ي')\n    ).replace(/\\s+/g, ' ');\n  }\n  const WEEKDAY_AR = ['الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة', 'السبت'];\n  const MONTH_AR = ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو', 'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'];\n  function fmtDateAr(iso, withWeekday) {\n    if (!iso) return '—';\n    const [y, m, d] = iso.split('-').map(Number);\n    const dt = new Date(Date.UTC(y, m - 1, d));\n    const wd = WEEKDAY_AR[dt.getUTCDay()];\n    const base = `${d} ${MONTH_AR[m - 1]} ${y}`;\n    return withWeekday ? `${wd}، ${base}` : base;\n  }\n  function fmtDateShort(iso) {\n    if (!iso) return '';\n    const [, m, d] = iso.split('-');\n    return `${d}/${m}`;\n  }\n\n  const STATUS_META = {\n    present:            { label: 'حاضر',                    cls: 'good',    group: 'present' },\n    missing_checkout:   { label: 'بدون بصمة انصراف',          cls: 'warn',    group: 'other' },\n    absent:             { label: 'غياب',                     cls: 'crit',    group: 'absent' },\n    no_show:            { label: 'لم يسجل حضور',              cls: 'crit',    group: 'absent' },\n    off:                { label: 'اوف (يوم راحة)',            cls: 'off',     group: 'off' },\n    leave_pending:      { label: 'إجازة تحت الموافقة',         cls: 'leave',   group: 'leave' },\n    leave_annual:       { label: 'إجازة سنوية',                cls: 'leave',   group: 'leave' },\n    leave_sick:         { label: 'إجازة مرضية',                cls: 'leave',   group: 'leave' },\n    other:              { label: 'أخرى',                      cls: 'warn',    group: 'other' },\n    unknown:            { label: 'غير محدد',                  cls: 'off',     group: 'other' },\n  };\n  function statusMeta(s) { return STATUS_META[s] || { label: s, cls: 'off', group: 'other' }; }\n\n  const GROUP_META = {\n    present: { label: 'حاضر', color: 'var(--good)' },\n    leave:   { label: 'إجازة', color: 'var(--leave)' },\n    absent:  { label: 'غياب', color: 'var(--crit)' },\n    off:     { label: 'اوف', color: 'var(--off)' },\n    other:   { label: 'أخرى / بدون بصمة', color: 'var(--warn)' },\n  };\n  const GROUP_ORDER = ['present', 'leave', 'off', 'other', 'absent'];\n\n  /* ---------------- monthly compliance helpers ---------------- */\n  const GRACE_MINUTES = 15;\n  // Employees on an HR-approved flexible/informal schedule: their check-in time is never\n  // counted as \"late\" in the monthly compliance report. The list travels with the data\n  // (policy.flexible_ids, edited by the admin on the site); it is never part of this code.\n  let FLEXIBLE_HOURS_IDS = new Set();\n  function parseTimeToMinutes(t) {\n    if (!t) return null;\n    const m = String(t).trim().match(/^(\\d{1,2}):(\\d{2})\\s*(AM|PM)$/i);\n    if (!m) return null;\n    let h = parseInt(m[1], 10);\n    const min = parseInt(m[2], 10);\n    const mer = m[3].toUpperCase();\n    if (mer === 'PM' && h !== 12) h += 12;\n    if (mer === 'AM' && h === 12) h = 0;\n    return h * 60 + min;\n  }\n  // shift strings are formatted \"{end hh:mm AM/PM} {start hh:mm AM/PM}\"\n  function parseShiftStartMinutes(shift) {\n    if (!shift) return null;\n    const tokens = String(shift).trim().split(/\\s+/);\n    if (tokens.length < 4) return null;\n    return parseTimeToMinutes(`${tokens[2]} ${tokens[3]}`);\n  }\n  // custom payroll month: runs from the 18th of one month to the 17th of the next\n  function monthBucketOf(dateStr) {\n    const [y, m, d] = dateStr.split('-').map(Number);\n    let startY = y, startM = m;\n    if (d < 18) {\n      startM -= 1;\n      if (startM === 0) { startM = 12; startY -= 1; }\n    }\n    const endM = startM === 12 ? 1 : startM + 1;\n    const endY = startM === 12 ? startY + 1 : startY;\n    const key = `${startY}-${String(startM).padStart(2, '0')}-18`;\n    const yearPart = startY === endY ? String(startY) : `${startY}/${endY}`;\n    const label = `18 ${MONTH_AR[startM - 1]} – 17 ${MONTH_AR[endM - 1]} ${yearPart}`;\n    return { key, label };\n  }\n\n  /* ---------------- state ---------------- */\n  const STATE = {\n    roster: [],\n    records: [],\n    leaveLog: [],\n    meta: {},\n    updatedAt: null,\n    sourceLabel: 'الملف الأصلي المرفوع',\n    // derived\n    byId: new Map(),\n    recordsByEmp: new Map(),\n    leaveByEmp: new Map(),\n    dates: [],\n    tab: 'overview',\n    selectedDate: null,\n    query: '',\n    leaveFilters: { dept: '', group: '' },\n    complianceMonths: [],\n    complianceRows: [],\n    complianceMonth: null,\n    complianceDept: '',\n    sheetsLink: null,\n  };\n\n  function setData(data, sourceLabel, updatedAt) {\n    STATE.roster = data.roster || [];\n    STATE.records = data.records || [];\n    STATE.leaveLog = data.leave_log || [];\n    STATE.meta = data.meta || {};\n    STATE.sourceLabel = sourceLabel || STATE.sourceLabel;\n    STATE.updatedAt = updatedAt || new Date().toISOString();\n\n    STATE.byId = new Map(STATE.roster.map(e => [e.id, e]));\n    STATE.recordsByEmp = new Map();\n    STATE.records.forEach(r => {\n      if (!STATE.recordsByEmp.has(r.id)) STATE.recordsByEmp.set(r.id, []);\n      STATE.recordsByEmp.get(r.id).push(r);\n    });\n    STATE.leaveByEmp = new Map();\n    STATE.leaveLog.forEach(r => {\n      if (!STATE.leaveByEmp.has(r.id)) STATE.leaveByEmp.set(r.id, []);\n      STATE.leaveByEmp.get(r.id).push(r);\n    });\n    const trackedIds = new Set(STATE.records.map(r => r.id));\n    STATE.roster.forEach(e => { e.tracked = trackedIds.has(e.id); });\n\n    STATE.dates = (STATE.meta.daily_dates && STATE.meta.daily_dates.length)\n      ? STATE.meta.daily_dates.slice()\n      : Array.from(new Set(STATE.records.map(r => r.date))).sort();\n    STATE.selectedDate = STATE.dates[STATE.dates.length - 1] || null;\n\n    FLEXIBLE_HOURS_IDS = new Set(((data.policy && data.policy.flexible_ids) || []).map(String));\n    computeCompliance();\n  }\n\n  // monthly attendance/punctuality compliance: 15-minute grace on scheduled check-in,\n  // custom payroll month running the 18th through the 17th of the next month.\n  function computeCompliance() {\n    const trackedIds = new Set(STATE.roster.filter(e => e.tracked).map(e => e.id));\n    const EXCLUDED_STATUSES = new Set(['off', 'leave_pending', 'leave_annual', 'leave_sick']);\n    const byKey = new Map();\n    const monthsMap = new Map();\n\n    STATE.records.forEach(r => {\n      if (!trackedIds.has(r.id)) return;\n      if (EXCLUDED_STATUSES.has(r.status)) return;\n      const mb = monthBucketOf(r.date);\n      monthsMap.set(mb.key, mb.label);\n      const k = r.id + '|' + mb.key;\n      if (!byKey.has(k)) byKey.set(k, { id: r.id, monthKey: mb.key, scheduled: 0, ontime: 0, late: 0, incomplete: 0, absent: 0 });\n      const row = byKey.get(k);\n      row.scheduled++;\n      if (r.status === 'present') {\n        if (FLEXIBLE_HOURS_IDS.has(r.id)) {\n          row.ontime++;\n        } else {\n          const startMin = parseShiftStartMinutes(r.shift);\n          const ciMin = parseTimeToMinutes(r.ci);\n          if (startMin !== null && ciMin !== null && ciMin <= startMin + GRACE_MINUTES) row.ontime++;\n          else row.late++;\n        }\n      } else if (r.status === 'missing_checkout') {\n        row.incomplete++;\n      } else {\n        row.absent++;\n      }\n    });\n\n    STATE.complianceMonths = Array.from(monthsMap.entries())\n      .map(([key, label]) => ({ key, label }))\n      .sort((a, b) => a.key.localeCompare(b.key));\n    STATE.complianceRows = Array.from(byKey.values()).map(row => ({\n      ...row,\n      pct: row.scheduled ? Math.round((row.ontime / row.scheduled) * 100) : 0,\n    }));\n    if (!STATE.complianceMonth || !STATE.complianceMonths.some(m => m.key === STATE.complianceMonth)) {\n      STATE.complianceMonth = STATE.complianceMonths.length ? STATE.complianceMonths[STATE.complianceMonths.length - 1].key : null;\n    }\n  }\n\n  // unified log: tracked-employee non-present daily records + leave_log entries for untracked employees\n  function unifiedLog() {\n    const trackedIds = new Set(STATE.roster.filter(e => e.tracked).map(e => e.id));\n    const rows = [];\n    STATE.records.forEach(r => {\n      if (r.status !== 'present') {\n        rows.push({ id: r.id, date: r.date, status: r.status, note: r.note, ci: r.ci, co: r.co, raw: statusMeta(r.status).label });\n      }\n    });\n    STATE.leaveLog.forEach(r => {\n      if (!trackedIds.has(r.id)) {\n        rows.push({ id: r.id, date: r.date, status: r.status, note: r.note, ci: null, co: null, raw: r.raw });\n      }\n    });\n    rows.sort((a, b) => b.date.localeCompare(a.date));\n    return rows;\n  }\n\n  /* ---------------- chart builders (SVG) ---------------- */\n  function deptBarChart(roster) {\n    const counts = new Map();\n    roster.forEach(e => counts.set(e.department || 'غير محدد', (counts.get(e.department || 'غير محدد') || 0) + 1));\n    const items = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);\n    const max = items[0][1];\n    const rowH = 30, gap = 10, leftLabelW = 190, chartW = 420, padTop = 8;\n    const H = items.length * (rowH + gap) - gap + padTop * 2;\n    const W = leftLabelW + chartW + 50;\n    let bars = '';\n    items.forEach(([name, val], i) => {\n      const y = padTop + i * (rowH + gap);\n      const w = Math.max(4, (val / max) * chartW);\n      const barId = `dbar${i}`;\n      bars += `\n        <g class=\"dept-row\" tabindex=\"0\" role=\"img\" aria-label=\"${esc(name)}: ${val}\">\n          <text x=\"${leftLabelW - 12}\" y=\"${y + rowH / 2}\" class=\"dept-label\" text-anchor=\"end\" dominant-baseline=\"middle\">${esc(name)}<\/text>\n          <rect x=\"${leftLabelW}\" y=\"${y + 3}\" width=\"${chartW}\" height=\"${rowH - 6}\" rx=\"5\" class=\"dept-track\"><\/rect>\n          <rect x=\"${leftLabelW}\" y=\"${y + 3}\" width=\"0\" height=\"${rowH - 6}\" rx=\"5\" class=\"dept-bar\" data-w=\"${w}\">\n            <animate attributeName=\"width\" from=\"0\" to=\"${w}\" dur=\"0.6s\" begin=\"${i * 0.03}s\" fill=\"freeze\" />\n          <\/rect>\n          <text x=\"${leftLabelW + w + 8}\" y=\"${y + rowH / 2}\" class=\"dept-value\" dominant-baseline=\"middle\">${val}<\/text>\n        <\/g>`;\n    });\n    return `<svg viewBox=\"0 0 ${W} ${H}\" class=\"dept-chart\" role=\"group\" aria-label=\"توزيع الموظفين حسب الأقسام\" style=\"direction:ltr\">${bars}<\/svg>`;\n  }\n\n  function trendChart(records, dates) {\n    const byDate = new Map();\n    dates.forEach(d => byDate.set(d, { present: 0, leave: 0, absent: 0, off: 0, other: 0, total: 0, breakdown: {} }));\n    records.forEach(r => {\n      const bucket = byDate.get(r.date);\n      if (!bucket) return;\n      const g = statusMeta(r.status).group;\n      bucket[g] = (bucket[g] || 0) + 1;\n      bucket.total++;\n      bucket.breakdown[r.status] = (bucket.breakdown[r.status] || 0) + 1;\n    });\n    const maxTotal = Math.max(1, ...Array.from(byDate.values()).map(b => b.total));\n    const barW = 20, gap = 6, chartH = 190, padL = 34, padB = 46, padT = 10;\n    const W = padL + dates.length * (barW + gap);\n    const H = chartH + padT + padB;\n    let bars = '', xlabels = '';\n    // y gridlines (0,25,50,75,100%)\n    let grid = '';\n    [0, 0.25, 0.5, 0.75, 1].forEach(f => {\n      const y = padT + chartH - f * chartH;\n      grid += `<line x1=\"${padL}\" y1=\"${y}\" x2=\"${W}\" y2=\"${y}\" class=\"grid-line\" />`;\n    });\n    dates.forEach((d, i) => {\n      const b = byDate.get(d);\n      const x = padL + i * (barW + gap);\n      let y = padT + chartH;\n      let seg = '';\n      GROUP_ORDER.forEach(g => {\n        const v = b[g] || 0;\n        if (!v) return;\n        const h = (v / maxTotal) * chartH;\n        y -= h;\n        seg += `<rect x=\"${x}\" y=\"${y.toFixed(1)}\" width=\"${barW}\" height=\"${h.toFixed(1)}\" fill=\"${GROUP_META[g].color}\" class=\"trend-seg\"><title>${esc(fmtDateAr(d))} — ${GROUP_META[g].label}: ${v}<\/title><\/rect>`;\n      });\n      bars += `<g class=\"trend-bar\" data-date=\"${d}\">${seg}<rect x=\"${x}\" y=\"${padT}\" width=\"${barW}\" height=\"${chartH}\" fill=\"transparent\" class=\"trend-hit\" data-date=\"${d}\"/><\/g>`;\n      if (i % 3 === 0 || i === dates.length - 1) {\n        xlabels += `<text x=\"${x + barW / 2}\" y=\"${padT + chartH + 18}\" class=\"trend-xlabel\" text-anchor=\"middle\">${esc(fmtDateShort(d))}<\/text>`;\n      }\n    });\n    let ylabels = '';\n    [0, 0.5, 1].forEach(f => {\n      const y = padT + chartH - f * chartH;\n      ylabels += `<text x=\"${padL - 8}\" y=\"${y + 3}\" class=\"trend-ylabel\" text-anchor=\"end\">${Math.round(f * maxTotal)}<\/text>`;\n    });\n    return `<svg viewBox=\"0 0 ${W} ${H}\" class=\"trend-chart\" role=\"img\" aria-label=\"اتجاه الحضور اليومي\" style=\"direction:ltr\">${grid}${bars}${ylabels}${xlabels}<\/svg>`;\n  }\n\n  /* ---------------- rendering ---------------- */\n  const $ = sel => document.querySelector(sel);\n  const $$ = sel => Array.from(document.querySelectorAll(sel));\n\n  function renderKPIs() {\n    const total = STATE.roster.length;\n    const depts = new Set(STATE.roster.map(e => e.department)).size;\n    const latest = STATE.selectedDate;\n    const todayRecs = STATE.records.filter(r => r.date === latest);\n    const present = todayRecs.filter(r => statusMeta(r.status).group === 'present').length;\n    const trackedToday = todayRecs.length;\n    const rate = trackedToday ? Math.round((present / trackedToday) * 100) : 0;\n    const exceptions = todayRecs.filter(r => r.status !== 'present').length;\n\n    $('#kpis').innerHTML = `\n      <div class=\"kpi\">\n        <div class=\"kpi-label\">إجمالي الموظفين<\/div>\n        <div class=\"kpi-value\">${total}<\/div>\n        <div class=\"kpi-sub\">عبر ${depts} أقسام<\/div>\n      <\/div>\n      <div class=\"kpi\">\n        <div class=\"kpi-label\">نسبة الحضور — آخر يوم مسجل<\/div>\n        <div class=\"kpi-value\">${rate}%<\/div>\n        <div class=\"kpi-sub\">${fmtDateAr(latest)}<\/div>\n      <\/div>\n      <div class=\"kpi\">\n        <div class=\"kpi-label\">حالات استثنائية اليوم<\/div>\n        <div class=\"kpi-value\">${exceptions}<\/div>\n        <div class=\"kpi-sub\">غياب / إجازة / بدون بصمة<\/div>\n      <\/div>\n      <div class=\"kpi\">\n        <div class=\"kpi-label\">قيود الإجازات والغياب المسجلة<\/div>\n        <div class=\"kpi-value\">${unifiedLog().length}<\/div>\n        <div class=\"kpi-sub\">خلال ${STATE.dates.length} يوم عمل<\/div>\n      <\/div>`;\n  }\n\n  function renderOverview() {\n    renderKPIs();\n    $('#dept-chart').innerHTML = deptBarChart(STATE.roster);\n    $('#trend-chart').innerHTML = trendChart(STATE.records, STATE.dates);\n    const rangeEl = $('#range-note');\n    if (rangeEl) {\n      rangeEl.textContent = `بيانات البصمة اليومية للأقسام المرتبطة بجهاز الحضور: من ${fmtDateAr(STATE.dates[0])} إلى ${fmtDateAr(STATE.dates[STATE.dates.length - 1])} (${STATE.dates.length} يوم عمل)`;\n    }\n    wireTrendTooltips();\n  }\n\n  function wireTrendTooltips() {\n    const tip = $('#tooltip');\n    $$('#trend-chart .trend-hit').forEach(el => {\n      el.addEventListener('mouseenter', e => showTrendTip(e, el.dataset.date));\n      el.addEventListener('mousemove', e => positionTip(e));\n      el.addEventListener('mouseleave', () => tip.hidden = true);\n      el.addEventListener('click', e => showTrendTip(e, el.dataset.date, true));\n    });\n  }\n  function showTrendTip(e, date, pin) {\n    const tip = $('#tooltip');\n    const recs = STATE.records.filter(r => r.date === date);\n    const counts = {};\n    recs.forEach(r => { const g = statusMeta(r.status).group; counts[g] = (counts[g] || 0) + 1; });\n    let rows = GROUP_ORDER.filter(g => counts[g]).map(g => `<div class=\"tip-row\"><span class=\"tip-dot\" style=\"background:${GROUP_META[g].color}\"><\/span>${GROUP_META[g].label}<b>${counts[g]}<\/b><\/div>`).join('');\n    tip.innerHTML = `<div class=\"tip-title\">${esc(fmtDateAr(date, true))}<\/div>${rows}`;\n    tip.hidden = false;\n    positionTip(e);\n  }\n  function positionTip(e) {\n    const tip = $('#tooltip');\n    const pad = 14;\n    let x = e.clientX + pad, y = e.clientY + pad;\n    const vw = window.innerWidth, vh = window.innerHeight;\n    tip.style.left = Math.min(x, vw - 220) + 'px';\n    tip.style.top = Math.min(y, vh - 140) + 'px';\n  }\n\n  function renderDailyTab() {\n    const sel = $('#date-select');\n    if (sel && sel.options.length !== STATE.dates.length) {\n      sel.innerHTML = STATE.dates.map(d => `<option value=\"${d}\">${esc(fmtDateAr(d, true))}<\/option>`).join('');\n    }\n    if (sel) sel.value = STATE.selectedDate;\n\n    let recs = STATE.records.filter(r => r.date === STATE.selectedDate);\n    const q = normAr(STATE.query);\n    if (q) {\n      recs = recs.filter(r => {\n        const e = STATE.byId.get(r.id);\n        return normAr(r.id).includes(q) || (e && normAr(e.name).includes(q)) || (e && normAr(e.department).includes(q));\n      });\n    }\n    recs = recs.slice().sort((a, b) => (a.dept || '').localeCompare(b.dept || '', 'ar') || (STATE.byId.get(a.id)?.name || '').localeCompare(STATE.byId.get(b.id)?.name || '', 'ar'));\n\n    const counts = { present: 0, leave: 0, absent: 0, off: 0, other: 0 };\n    STATE.records.filter(r => r.date === STATE.selectedDate).forEach(r => counts[statusMeta(r.status).group]++);\n    $('#daily-chips').innerHTML = GROUP_ORDER.map(g => `<div class=\"chip chip-${g}\"><span>${GROUP_META[g].label}<\/span><b>${counts[g] || 0}<\/b><\/div>`).join('');\n\n    $('#daily-table-body').innerHTML = recs.map(r => {\n      const e = STATE.byId.get(r.id) || {};\n      const sm = statusMeta(r.status);\n      return `<tr>\n        <td class=\"cell-id\">${esc(r.id)}<\/td>\n        <td>${esc(e.name || '')}<\/td>\n        <td>${esc(r.dept || '')}<\/td>\n        <td><span class=\"pill pill-${sm.cls}\">${esc(sm.label)}<\/span><\/td>\n        <td class=\"num\">${esc(r.ci || '—')}<\/td>\n        <td class=\"num\">${esc(r.co || '—')}<\/td>\n        <td class=\"num\">${esc(r.dur || '—')}<\/td>\n        <td class=\"cell-note\">${esc(r.note || '')}<\/td>\n      <\/tr>`;\n    }).join('') || `<tr><td colspan=\"8\" class=\"empty-row\">لا توجد نتائج مطابقة<\/td><\/tr>`;\n\n    $('#daily-count').textContent = `${recs.length} من ${STATE.records.filter(r => r.date === STATE.selectedDate).length} سجل`;\n  }\n\n  function renderComplianceTab() {\n    const monthSel = $('#compliance-month-select');\n    if (monthSel.options.length !== STATE.complianceMonths.length) {\n      monthSel.innerHTML = STATE.complianceMonths.map(m => `<option value=\"${m.key}\">${esc(m.label)}<\/option>`).join('');\n    }\n    if (STATE.complianceMonth) monthSel.value = STATE.complianceMonth;\n\n    $('#compliance-rule-note').textContent =\n      'يُحسب التأخير المسموح به 15 دقيقة من بداية الدوام المجدول لكل موظف، ويُحتسب الشهر من 18 إلى 17 من الشهر التالي. يشمل المؤشر فقط الموظفين في الأقسام المرتبطة ببصمة الحضور اليومي. لا يُحتسب تأخير لموظفي الدوام المرن (حسب سياسة الموارد البشرية).';\n\n    const deptSel = $('#compliance-dept-filter');\n    if (deptSel.options.length <= 1) {\n      const depts = Array.from(new Set(STATE.roster.filter(e => e.tracked).map(e => e.department))).sort((a, b) => a.localeCompare(b, 'ar'));\n      deptSel.innerHTML = `<option value=\"\">كل الأقسام<\/option>` + depts.map(d => `<option value=\"${esc(d)}\">${esc(d)}<\/option>`).join('');\n    }\n    if (STATE.complianceDept) deptSel.value = STATE.complianceDept;\n\n    let rows = STATE.complianceRows.filter(r => r.monthKey === STATE.complianceMonth);\n    rows = rows.map(r => ({ ...r, emp: STATE.byId.get(r.id) || {} }));\n    const q = normAr(STATE.query);\n    if (q) rows = rows.filter(r => normAr(r.id).includes(q) || normAr(r.emp.name).includes(q));\n    if (STATE.complianceDept) rows = rows.filter(r => r.emp.department === STATE.complianceDept);\n    rows.sort((a, b) => a.pct - b.pct || (a.emp.name || '').localeCompare(b.emp.name || '', 'ar'));\n\n    const totals = rows.reduce((acc, r) => {\n      acc.scheduled += r.scheduled; acc.ontime += r.ontime; acc.late += r.late; acc.incomplete += r.incomplete; acc.absent += r.absent;\n      return acc;\n    }, { scheduled: 0, ontime: 0, late: 0, incomplete: 0, absent: 0 });\n    const overallPct = totals.scheduled ? Math.round((totals.ontime / totals.scheduled) * 100) : 0;\n\n    $('#compliance-kpis').innerHTML = `\n      <div class=\"kpi\">\n        <div class=\"kpi-label\">نسبة الالتزام العامة<\/div>\n        <div class=\"kpi-value\">${overallPct}%<\/div>\n        <div class=\"kpi-sub\">${rows.length} موظف هذا الشهر<\/div>\n      <\/div>\n      <div class=\"kpi\">\n        <div class=\"kpi-label\">ملتزم (ضمن وقت السماح)<\/div>\n        <div class=\"kpi-value\">${totals.ontime}<\/div>\n        <div class=\"kpi-sub\">من ${totals.scheduled} يوم مجدول<\/div>\n      <\/div>\n      <div class=\"kpi\">\n        <div class=\"kpi-label\">متأخر<\/div>\n        <div class=\"kpi-value\">${totals.late}<\/div>\n        <div class=\"kpi-sub\">تجاوز 15 دقيقة سماح<\/div>\n      <\/div>\n      <div class=\"kpi\">\n        <div class=\"kpi-label\">غياب / بدون بصمة انصراف<\/div>\n        <div class=\"kpi-value\">${totals.absent + totals.incomplete}<\/div>\n        <div class=\"kpi-sub\">${totals.absent} غياب، ${totals.incomplete} غير مكتمل<\/div>\n      <\/div>`;\n\n    $('#compliance-count').textContent = `${rows.length} موظف`;\n\n    $('#compliance-table-body').innerHTML = rows.map(r => {\n      const pctCls = r.pct >= 90 ? 'pct-good' : (r.pct >= 75 ? 'pct-warn' : 'pct-crit');\n      const seg = (val, color) => (r.scheduled && val) ? `<span style=\"width:${(val / r.scheduled * 100).toFixed(1)}%; background:${color}\"><\/span>` : '';\n      return `<tr>\n        <td class=\"cell-id\">${esc(r.id)}<\/td>\n        <td>${esc(r.emp.name || '')}<\/td>\n        <td>${esc(r.emp.department || '')}<\/td>\n        <td class=\"num\">${r.scheduled}<\/td>\n        <td class=\"num\">${r.ontime}<\/td>\n        <td class=\"num\">${r.late}<\/td>\n        <td class=\"num\">${r.incomplete}<\/td>\n        <td class=\"num\">${r.absent}<\/td>\n        <td><div class=\"mini-bar\">${seg(r.ontime, 'var(--good)')}${seg(r.late, 'var(--warn)')}${seg(r.incomplete, 'var(--off)')}${seg(r.absent, 'var(--crit)')}<\/div><\/td>\n        <td class=\"pct-cell ${pctCls}\">${r.pct}%<\/td>\n      <\/tr>`;\n    }).join('') || `<tr><td colspan=\"10\" class=\"empty-row\">لا توجد بيانات لهذا الشهر<\/td><\/tr>`;\n  }\n\n  function renderLeaveTab() {\n    let rows = unifiedLog();\n    const q = normAr(STATE.query);\n    const { dept, group } = STATE.leaveFilters;\n    rows = rows.map(r => ({ ...r, emp: STATE.byId.get(r.id) || {} }));\n    if (q) rows = rows.filter(r => normAr(r.id).includes(q) || normAr(r.emp.name).includes(q) || normAr(r.emp.department).includes(q));\n    if (dept) rows = rows.filter(r => r.emp.department === dept);\n    if (group) rows = rows.filter(r => statusMeta(r.status).group === group);\n\n    // dept filter options\n    const deptSel = $('#leave-dept-filter');\n    if (deptSel && deptSel.options.length <= 1) {\n      const depts = Array.from(new Set(STATE.roster.map(e => e.department))).sort((a, b) => a.localeCompare(b, 'ar'));\n      deptSel.innerHTML = `<option value=\"\">كل الأقسام<\/option>` + depts.map(d => `<option value=\"${esc(d)}\">${esc(d)}<\/option>`).join('');\n    }\n\n    $('#leave-table-body').innerHTML = rows.map(r => {\n      const sm = statusMeta(r.status);\n      return `<tr>\n        <td class=\"num\">${esc(fmtDateAr(r.date))}<\/td>\n        <td class=\"cell-id\">${esc(r.id)}<\/td>\n        <td>${esc(r.emp.name || '')}<\/td>\n        <td>${esc(r.emp.department || '')}<\/td>\n        <td><span class=\"pill pill-${sm.cls}\">${esc(r.raw || sm.label)}<\/span><\/td>\n        <td class=\"cell-note\">${esc(r.note || '')}<\/td>\n      <\/tr>`;\n    }).join('') || `<tr><td colspan=\"6\" class=\"empty-row\">لا توجد نتائج مطابقة<\/td><\/tr>`;\n    $('#leave-count').textContent = `${rows.length} من ${unifiedLog().length} قيد`;\n\n    // top list by employee — actual unexcused absence only (\"absent\"/\"no_show\"),\n    // never approved leave, so a long-leave employee never appears here just for\n    // having many leave_log entries.\n    const byEmp = new Map();\n    unifiedLog().forEach(r => {\n      if (statusMeta(r.status).group !== 'absent') return;\n      byEmp.set(r.id, (byEmp.get(r.id) || 0) + 1);\n    });\n    const top = Array.from(byEmp.entries()).sort((a, b) => b[1] - a[1]).slice(0, 6);\n    $('#leave-top').innerHTML = top.map(([id, n]) => {\n      const e = STATE.byId.get(id) || {};\n      return `<div class=\"top-row\"><span class=\"top-name\">${esc(e.name || id)}<\/span><span class=\"top-dept\">${esc(e.department || '')}<\/span><b class=\"top-n\">${n}<\/b><\/div>`;\n    }).join('') || '<div class=\"muted-note\">لا توجد بيانات<\/div>';\n  }\n\n  function renderDirectoryTab() {\n    let rows = STATE.roster.slice();\n    const q = normAr(STATE.query);\n    if (q) rows = rows.filter(e => normAr(e.id).includes(q) || normAr(e.name).includes(q) || normAr(e.department).includes(q));\n    rows.sort((a, b) => (a.department || '').localeCompare(b.department || '', 'ar') || (a.name || '').localeCompare(b.name || '', 'ar'));\n\n    $('#dir-count').textContent = `${rows.length} من ${STATE.roster.length} موظف`;\n    $('#dir-list').innerHTML = rows.map(e => {\n      const exceptions = (STATE.recordsByEmp.get(e.id) || []).filter(r => r.status !== 'present').length\n        + (e.tracked ? 0 : (STATE.leaveByEmp.get(e.id) || []).length);\n      return `<button class=\"dir-card\" data-id=\"${esc(e.id)}\">\n        <div class=\"dir-card-top\">\n          <span class=\"dir-name\">${esc(e.name)}<\/span>\n          <span class=\"tag ${e.tracked ? 'tag-tracked' : 'tag-untracked'}\">${e.tracked ? 'بصمة يومية' : 'سجل إجازات'}<\/span>\n        <\/div>\n        <div class=\"dir-card-bottom\">\n          <span class=\"dir-dept\">${esc(e.department || '—')}<\/span>\n          <span class=\"dir-id\">#${esc(e.id)}<\/span>\n        <\/div>\n        ${exceptions ? `<div class=\"dir-flag\">${exceptions} حالة مسجّلة<\/div>` : ''}\n      <\/button>`;\n    }).join('') || `<div class=\"empty-row\">لا توجد نتائج مطابقة<\/div>`;\n\n    $$('#dir-list .dir-card').forEach(btn => btn.addEventListener('click', () => openProfile(btn.dataset.id)));\n  }\n\n  function openProfile(id) {\n    const e = STATE.byId.get(id);\n    if (!e) return;\n    const modal = $('#profile-modal');\n    let bodyHtml = '';\n    if (e.tracked) {\n      const recs = (STATE.recordsByEmp.get(id) || []).slice().sort((a, b) => b.date.localeCompare(a.date));\n      bodyHtml = `<div class=\"profile-timeline\">${recs.map(r => {\n        const sm = statusMeta(r.status);\n        return `<div class=\"tl-row\">\n          <span class=\"tl-date\">${esc(fmtDateAr(r.date))}<\/span>\n          <span class=\"pill pill-${sm.cls}\">${esc(sm.label)}<\/span>\n          <span class=\"tl-time\">${r.ci ? `${esc(r.ci)} → ${esc(r.co || '—')}` : ''}<\/span>\n          <span class=\"tl-note\">${esc(r.note || '')}<\/span>\n        <\/div>`;\n      }).join('') || '<div class=\"muted-note\">لا توجد سجلات<\/div>'}<\/div>`;\n    } else {\n      const recs = (STATE.leaveByEmp.get(id) || []).slice().sort((a, b) => b.date.localeCompare(a.date));\n      bodyHtml = `<p class=\"muted-note\">هذا الموظف ضمن الأقسام غير المرتبطة ببصمة الحضور اليومية (${esc(e.department)}) — القيود التالية من سجل الإجازات والغياب فقط:<\/p>\n      <div class=\"profile-timeline\">${recs.map(r => {\n        const sm = statusMeta(r.status);\n        return `<div class=\"tl-row\">\n          <span class=\"tl-date\">${esc(fmtDateAr(r.date))}<\/span>\n          <span class=\"pill pill-${sm.cls}\">${esc(r.raw || sm.label)}<\/span>\n          <span class=\"tl-time\"><\/span>\n          <span class=\"tl-note\">${esc(r.note || '')}<\/span>\n        <\/div>`;\n      }).join('') || '<div class=\"muted-note\">لا توجد قيود مسجلة لهذا الموظف<\/div>'}<\/div>`;\n    }\n    $('#profile-title').textContent = e.name;\n    $('#profile-sub').textContent = `#${e.id} · ${e.department || '—'}`;\n    $('#profile-body').innerHTML = bodyHtml;\n    modal.hidden = false;\n    document.body.classList.add('modal-open');\n  }\n  function closeProfile() {\n    $('#profile-modal').hidden = true;\n    document.body.classList.remove('modal-open');\n  }\n\n  function renderSearchDropdown() {\n    const box = $('#search-drop');\n    const q = normAr(STATE.query);\n    if (!q) { box.hidden = true; box.innerHTML = ''; return; }\n    const matches = STATE.roster.filter(e => normAr(e.id).includes(q) || normAr(e.name).includes(q)).slice(0, 8);\n    if (!matches.length) { box.hidden = true; return; }\n    box.innerHTML = matches.map(e => `<button class=\"search-item\" data-id=\"${esc(e.id)}\">\n      <span>${esc(e.name)}<\/span><span class=\"search-item-dept\">${esc(e.department || '')} · #${esc(e.id)}<\/span>\n    <\/button>`).join('');\n    box.hidden = false;\n    $$('#search-drop .search-item').forEach(btn => btn.addEventListener('click', () => {\n      box.hidden = true;\n      setTab('directory');\n      openProfile(btn.dataset.id);\n    }));\n  }\n\n  function renderAll() {\n    renderOverview();\n    renderDailyTab();\n    renderComplianceTab();\n    renderLeaveTab();\n    renderDirectoryTab();\n    $('#update-meta').textContent = `آخر تحديث: ${fmtDateTime(STATE.updatedAt)} — المصدر: ${STATE.sourceLabel}`;\n  }\n  function fmtDateTime(iso) {\n    if (!iso) return '—';\n    const d = new Date(iso);\n    if (isNaN(d)) return iso;\n    return d.toLocaleString('ar-SA', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });\n  }\n\n  function setTab(tab) {\n    STATE.tab = tab;\n    $$('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));\n    $$('.tab-panel').forEach(p => p.hidden = p.dataset.panel !== tab);\n    if (tab === 'daily') renderDailyTab();\n    if (tab === 'compliance') renderComplianceTab();\n    if (tab === 'leave') renderLeaveTab();\n    if (tab === 'directory') renderDirectoryTab();\n  }\n\n  /* ---------------- boot ---------------- */\n  function loadInitialData() {\n    // the site sends the data (and the theme) by postMessage; nothing is stored or fetched here\n    window.addEventListener('message', function (e) {\n      if (e.source !== window.parent) return;\n      const m = e.data;\n      if (!m || m.dentera !== 'att') return;\n      const root = document.documentElement;\n      if (m.theme === 'light' || m.theme === 'dark') root.setAttribute('data-theme', m.theme); else root.removeAttribute('data-theme');\n      if (m.page) root.style.setProperty('--page', m.page);\n      if (m.type === 'data' && m.data && Array.isArray(m.data.roster)) {\n        const keepDate = STATE.selectedDate;\n        setData(m.data, m.data._sourceLabel || 'ملف الحضور', m.data._updatedAt || null);\n        if (keepDate && STATE.dates.indexOf(keepDate) >= 0) STATE.selectedDate = keepDate;\n        renderAll();\n      }\n    });\n    window.parent.postMessage({ dentera: 'att', type: 'ready' }, '*');\n  }\n\n  function wireUI() {\n    $$('.tab-btn').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));\n    $('#profile-close').addEventListener('click', closeProfile);\n    $('#profile-modal').addEventListener('click', e => { if (e.target.id === 'profile-modal') closeProfile(); });\n    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeProfile(); });\n\n    $('#date-select').addEventListener('change', e => { STATE.selectedDate = e.target.value; renderDailyTab(); });\n    $('#date-prev').addEventListener('click', () => stepDate(-1));\n    $('#date-next').addEventListener('click', () => stepDate(1));\n\n    $('#leave-dept-filter').addEventListener('change', e => { STATE.leaveFilters.dept = e.target.value; renderLeaveTab(); });\n    $('#leave-group-filter').addEventListener('change', e => { STATE.leaveFilters.group = e.target.value; renderLeaveTab(); });\n\n    $('#compliance-month-select').addEventListener('change', e => { STATE.complianceMonth = e.target.value; renderComplianceTab(); });\n    $('#compliance-dept-filter').addEventListener('change', e => { STATE.complianceDept = e.target.value; renderComplianceTab(); });\n\n    const search = $('#global-search');\n    search.addEventListener('input', e => {\n      STATE.query = e.target.value;\n      renderSearchDropdown();\n      if (STATE.tab === 'daily') renderDailyTab();\n      if (STATE.tab === 'leave') renderLeaveTab();\n      if (STATE.tab === 'directory') renderDirectoryTab();\n      if (STATE.tab === 'compliance') renderComplianceTab();\n    });\n    search.addEventListener('focus', renderSearchDropdown);\n    document.addEventListener('click', e => {\n      if (!e.target.closest('.search-wrap')) $('#search-drop').hidden = true;\n    });\n\n  }\n  function stepDate(delta) {\n    const idx = STATE.dates.indexOf(STATE.selectedDate);\n    const next = Math.min(STATE.dates.length - 1, Math.max(0, idx + delta));\n    STATE.selectedDate = STATE.dates[next];\n    renderDailyTab();\n  }\n\n  function boot() {\n    wireUI();\n    loadInitialData();\n  }\n\n  boot();\n})();\n<\/script><\/body><\/html>";
 /* ---- helpers (from the HR dashboard) ---- */
 function $(sel, ctx){ return (ctx||document).querySelector(sel); }
 function $all(sel, ctx){ return Array.prototype.slice.call((ctx||document).querySelectorAll(sel)); }
@@ -1349,6 +1728,7 @@ var S = { role: null, user: null, username: '', authDone: false, fbError: null }
 var PUB = null;          // public tier: licensed-staff list (readable by every visitor)
 var PUB_STATE = 'loading';   // loading | empty | ready | error
 var DATA = null;         // private tier: sanitized datasets for HR users, full datasets for the admin
+var SYNC = null;         // admin only: status doc written by the Google Sheets auto-sync (fin/sync)
 var HRMETA = null;       // meta doc of the private tier
 var REPORT = null;       // monthly report, computed in the browser from DATA
 var HR_STATE = 'idle';   // idle | loading | empty | ready | error
@@ -1389,6 +1769,7 @@ var ICONS = {
   contracts:'<path d="M6 3h9l3 3v15H6V3Z"/><path d="M9 10h6M9 13.5h6M9 17h4" stroke-linecap="round"/>',
   growth:'<path d="M4 18 9.5 12l4 3L20 7" stroke-linecap="round" stroke-linejoin="round"/><path d="M15 7h5v5" stroke-linecap="round" stroke-linejoin="round"/>',
   directory:'<circle cx="10.5" cy="10.5" r="6.5"/><path d="m20 20-4.3-4.3" stroke-linecap="round"/>',
+  attendance:'<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2" stroke-linecap="round" stroke-linejoin="round"/>',
   monthly:'<rect x="3.5" y="5" width="17" height="15" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4M8 17v-3M12 17v-5M16 17v-2" stroke-linecap="round"/>',
   medlic:'<path d="M12 3l7 3v5c0 4.8-3 8.3-7 10-4-1.7-7-5.2-7-10V6l7-3Z"/><path d="M12 8.5v5M9.5 11h5" stroke-linecap="round"/>',
   medall:'<circle cx="9" cy="8" r="3"/><circle cx="17" cy="9" r="2.4"/><path d="M3.5 20c.6-3.3 2.9-5.3 5.5-5.3s4.9 2 5.5 5.3M15.5 14.3c2.3.2 4.1 2 4.6 4.7" stroke-linecap="round"/>',
@@ -2679,6 +3060,23 @@ function previewTable(newData){
     }).join('') + '</tbody></table></div>';
 }
 
+/* SheetJS builds each date as "local midnight" using the 1899 clock of the browser's time zone. In zones whose 1899 offset
+   differs from today's by a few minutes (Riyadh, Kolkata…) that lands a few minutes BEFORE midnight, so every date came out a
+   day early. Moving to noon and keeping only the calendar day gives the same date in every time zone (UTC midnight, as the extractor expects). */
+function fixSheetDates(wb){
+  Object.keys(wb.Sheets || {}).forEach(function(n){
+    var ws = wb.Sheets[n];
+    Object.keys(ws).forEach(function(a){
+      if(a.charAt(0) === '!') return;
+      var c = ws[a];
+      if(c && c.t === 'd' && c.v instanceof Date && !isNaN(c.v.getTime())){
+        var t = new Date(c.v.getTime() + 12 * 3600 * 1000);
+        c.v = new Date(Date.UTC(t.getFullYear(), t.getMonth(), t.getDate()));
+      }
+    });
+  });
+}
+
 async function handleFile(file){
   if(!file) return;
   UP = null; setMsg('info', 'جاري قراءة الملف…');
@@ -2686,6 +3084,7 @@ async function handleFile(file){
     await loadXLSX();
     var buf = await file.arrayBuffer();
     var wb = XLSX.read(new Uint8Array(buf), { type: 'array', cellDates: true });
+    fixSheetDates(wb);
     var d = window.DenteraExtract.extractAll(wb);
     var total = DS_KEYS.reduce(function(a, k){ return a + (d[k] ? d[k].length : 0); }, 0);
     if(!total) throw new Error('لم يُعثر على بيانات. تأكد أن الملف هو ملف البيانات الرئيسي وبنفس أسماء الأوراق.');
@@ -2716,11 +3115,151 @@ async function confirmUpload(){
   }
 }
 
+/* ---------------- Attendance data (admin) ---------------- */
+var ATT_UP = null;       // parsed attendance file waiting for confirmation
+
+function setAttMsg(kind, text){ var el = $('#attMsg'); if(el) el.innerHTML = text ? '<div class="status ' + kind + '">' + esc(text) + '</div>' : ''; }
+function attRange(o){
+  var r = o && o.meta && o.meta.daily_date_range;
+  return (r && r[0]) ? 'من <span class="num" dir="ltr">' + esc(r[0]) + '</span> إلى <span class="num" dir="ltr">' + esc(r[1]) + '</span>' : '—';
+}
+function attStatusHTML(){
+  var A = DATA && DATA.attendance;
+  if(!A || !Array.isArray(A.roster) || !A.roster.length) return 'لا توجد بيانات حضور محفوظة بعد.';
+  return 'المحفوظ الآن: ' + fmtNum(A.roster.length) + ' موظفًا · ' + fmtNum((A.records || []).length) + ' سجل حضور · ' + attRange(A) +
+    (A._updatedAt ? ' · آخر تحديث ' + fmtStamp(A._updatedAt) : '');
+}
+/* the old standalone dashboard file keeps its data in a script tag; read it from there */
+function attFromHtml(text){
+  var i = text.indexOf('id="dashboard-data-script"');
+  if(i < 0) throw new Error('هذا الملف ليس ملف لوحة الحضور.');
+  var k = text.indexOf('__DASHBOARD_DATA__', i);
+  var a = k < 0 ? -1 : text.indexOf('=', k) + 1, b = a > 0 ? text.indexOf('<' + '/script>', a) : -1;
+  if(a <= 0 || b < 0) throw new Error('تعذّر قراءة البيانات من الملف.');
+  var data = JSON.parse(text.slice(a, b).trim().replace(/;\s*$/, ''));
+  /* the old dashboard kept its flexible-hours list inside its code: carry it over as data */
+  var m = text.match(/FLEXIBLE_HOURS_IDS\s*=\s*new Set\(\s*\[([\s\S]*?)\]\s*\)/);
+  if(m) data.policy = { flexible_ids: (m[1].match(/'(\d{3,6})'/g) || []).map(function(x){ return x.replace(/'/g, ''); }) };
+  return data;
+}
+function attPreviewTable(base, merged){
+  var cnt = function(o, k){ return ((o && o[k]) || []).length; };
+  var days = function(o){ return ((o && o.meta && o.meta.daily_dates) || []).length; };
+  var row = function(label, a, b){ var d = b - a; return '<tr><td>' + esc(label) + '</td><td class="num">' + fmtNum(a) + '</td><td class="num">' + fmtNum(b) + '</td><td class="num">' + (d > 0 ? '+' : (d < 0 ? '−' : '')) + fmtNum(Math.abs(d)) + '</td></tr>'; };
+  return '<div class="table-wrap"><table><thead><tr><th></th><th class="num">الحالي</th><th class="num">بعد الإضافة</th><th class="num">الفرق</th></tr></thead><tbody>' +
+    row('الموظفون', cnt(base, 'roster'), cnt(merged, 'roster')) +
+    row('أيام الحضور', days(base), days(merged)) +
+    row('سجلات الحضور اليومي', cnt(base, 'records'), cnt(merged, 'records')) +
+    row('قيود الإجازات والغياب', cnt(base, 'leave_log'), cnt(merged, 'leave_log')) +
+    '</tbody></table></div><div class="xl-note" style="margin-top:8px">المدى الزمني بعد الإضافة: ' + attRange(merged) + '</div>';
+}
+async function handleAttFile(file){
+  if(!file) return;
+  ATT_UP = null; var box = $('#attPreview'); if(box) box.innerHTML = '';
+  setAttMsg('info', 'جاري قراءة الملف…');
+  try{
+    var parsed, label;
+    if(/\.html?$/i.test(file.name)){ parsed = attFromHtml(await file.text()); label = 'لوحة الحضور — ' + file.name; }
+    else {
+      await loadXLSX();
+      var wb = XLSX.read(new Uint8Array(await file.arrayBuffer()), { type: 'array' });
+      parsed = window.DenteraAttendance.parse(wb); label = 'ملف حضور — ' + file.name;
+    }
+    if(!parsed || !Array.isArray(parsed.roster) || !parsed.roster.length || !Array.isArray(parsed.records))
+      throw new Error('لم يتم التعرف على بيانات موظفين في الملف. تأكد أنه بنفس تنسيق ملف الحضور الأصلي (تبويب يومي لكل تاريخ + تبويب الغياب).');
+    var base = (DATA && DATA.attendance && Array.isArray(DATA.attendance.roster)) ? DATA.attendance : { meta: {}, roster: [], records: [], leave_log: [] };
+    var merged = window.DenteraAttendance.merge(base, parsed);
+    merged.status_labels = merged.status_labels || window.DenteraAttendance.LABELS;
+    merged.policy = parsed.policy || base.policy || { flexible_ids: [] };
+    var changed = merged.records.length !== (base.records || []).length || merged.leave_log.length !== (base.leave_log || []).length || merged.roster.length !== (base.roster || []).length;
+    ATT_UP = { label: label, data: merged };
+    setAttMsg(null);
+    box = $('#attPreview');
+    box.innerHTML = '<div class="status ' + (changed ? 'info' : 'warn') + '">' + (changed
+        ? 'تمت قراءة «' + esc(file.name) + '». تُضاف الأيام الجديدة فقط، ولا يُعاد تعديل أي يوم محفوظ سابقًا.'
+        : 'لا يوجد في «' + esc(file.name) + '» أيام أو موظفون جدد، فلن يتغير شيء.') + '</div>' +
+      attPreviewTable(base, merged) +
+      '<div class="btn-row" style="margin-top:12px">' + (changed ? '<button class="btn" id="attConfirm">اعتماد وحفظ</button>' : '') + '<button class="btn ghost" id="attCancel">إلغاء</button></div>';
+    $('#attCancel').addEventListener('click', function(){ ATT_UP = null; box.innerHTML = ''; });
+    var c = $('#attConfirm'); if(c) c.addEventListener('click', confirmAtt);
+  }catch(e){
+    setAttMsg('error', 'تعذّرت قراءة الملف: ' + (e && e.message ? e.message : e));
+  }
+}
+async function confirmAtt(){
+  if(!ATT_UP) return;
+  var b = $('#attConfirm'); if(b){ b.disabled = true; b.textContent = 'جاري الحفظ…'; }
+  try{
+    var payload = Object.assign({}, ATT_UP.data, { _updatedAt: new Date().toISOString(), _sourceLabel: ATT_UP.label });
+    await writeDatasets({ attendance: payload }, ATT_UP.label);
+    ATT_UP = null;
+    toast('تم حفظ بيانات الحضور');
+    RENDERERS.data();
+  }catch(e){
+    setAttMsg('error', 'تعذّر الحفظ: ' + (e && e.message ? e.message : e));
+    if(b){ b.disabled = false; b.textContent = 'اعتماد وحفظ'; }
+  }
+}
+function attPolicyHTML(){
+  var A = DATA && DATA.attendance;
+  if(!A || !Array.isArray(A.roster) || !A.roster.length) return '';
+  var ids = ((A.policy && A.policy.flexible_ids) || []).join(', ');
+  return '<div style="margin-top:16px"><div class="xl-note" style="margin-bottom:6px">الموظفون بدوام مرن: لا يُحتسب عليهم تأخير في الالتزام الشهري. اكتب أرقامهم الوظيفية مفصولة بفاصلة.</div>' +
+    '<div class="dir-toolbar" style="margin:0"><input type="text" id="attFlex" dir="ltr" inputmode="numeric" placeholder="مثال: 1013, 1069" value="' + esc(ids) + '"><button class="btn" id="attFlexSave">حفظ القائمة</button></div></div>';
+}
+async function saveAttPolicy(){
+  var A = DATA && DATA.attendance; if(!A) return;
+  var seen = {}, ids = String($('#attFlex').value || '').split(/[^0-9]+/).filter(function(x){ if(!x || seen[x]) return false; seen[x] = 1; return true; });
+  var known = {}; (A.roster || []).forEach(function(e){ known[e.id] = 1; });
+  var unknown = ids.filter(function(x){ return !known[x]; });
+  if(unknown.length){ setAttMsg('error', 'هذه الأرقام ليست في قائمة الموظفين: ' + unknown.join('، ')); return; }
+  var b = $('#attFlexSave'); if(b){ b.disabled = true; b.textContent = 'جاري الحفظ…'; }
+  try{
+    await writeDatasets({ attendance: Object.assign({}, A, { policy: { flexible_ids: ids }, _updatedAt: new Date().toISOString() }) }, 'تعديل قائمة الدوام المرن');
+    toast('تم حفظ القائمة');
+    RENDERERS.data();
+  }catch(e){
+    setAttMsg('error', 'تعذّر الحفظ: ' + (e && e.message ? e.message : e));
+    if(b){ b.disabled = false; b.textContent = 'حفظ القائمة'; }
+  }
+}
+function attPanelHTML(){
+  return '<div class="panel" id="attPanel"><h3>الحضور والإجازات</h3><div class="panel-sub">' + attStatusHTML() + '</div>' +
+    '<div id="attMsg"></div>' +
+    '<label class="file-drop" id="attDrop"><input type="file" id="attFile" accept=".xlsx,.xlsm,.xls,.html,.htm">' + icon('upload').replace('<svg ', '<svg width="26" height="26" ') +
+      '<div style="margin-top:6px">ارفع ملف الحضور (إكسل) أو ملف لوحة الحضور القديمة (HTML)</div>' +
+      '<div class="xl-note">يُقرأ الملف داخل المتصفح. يضيف الأيام الجديدة فقط ولا يمسّ الأيام المحفوظة. تظهر الصفحة للموارد البشرية والأدمن فقط.</div></label>' +
+    '<div id="attPreview" style="margin-top:12px"></div>' + attPolicyHTML() + '</div>';
+}
+function wireAttPanel(){
+  var fsv = $('#attFlexSave'); if(fsv) fsv.addEventListener('click', saveAttPolicy);
+  var f = $('#attFile'); if(!f) return;
+  f.addEventListener('change', function(){ handleAttFile(f.files && f.files[0]); f.value = ''; });
+  var drop = $('#attDrop');
+  ['dragenter', 'dragover'].forEach(function(n){ drop.addEventListener(n, function(e){ e.preventDefault(); drop.classList.add('over'); }); });
+  ['dragleave', 'drop'].forEach(function(n){ drop.addEventListener(n, function(e){ e.preventDefault(); drop.classList.remove('over'); }); });
+  drop.addEventListener('drop', function(e){ var fl = e.dataTransfer && e.dataTransfer.files; if(fl && fl[0]) handleAttFile(fl[0]); });
+}
+
+/* last result of the automatic Google Sheets sync (written by the Apps Script as fin/sync) */
+function syncCardHTML(){
+  var s = SYNC, body;
+  if(!s){
+    body = '<div class="status info">لم تصل أي مزامنة تلقائية بعد. بعد تركيب سكربت المزامنة في Google يظهر هنا نتيجة كل تحديث.</div>';
+  }else{
+    var lines = String(s.msg || '').split('\n').map(function(l){ return esc(l); }).join('<br>');
+    body = '<div class="status ' + (s.ok ? 'success' : 'error') + '">' + (s.ok ? 'آخر مزامنة ناجحة: ' : 'آخر محاولة لم تكتمل: ') + fmtStamp(s.at) + '</div>' +
+      '<div class="panel-sub" style="margin-top:10px">' + lines + '</div>';
+  }
+  return '<div class="panel"><h3>المزامنة التلقائية مع Google Sheets</h3>' +
+    '<div class="panel-sub">أي تعديل تحفظه في ملف «بيانات جميع الموظفين» أو شيت الحضور يصل هنا خلال دقيقة أو دقيقتين، بدون رفع.</div>' + body + '</div>';
+}
+
 function accessCard(){
   return '<div class="panel"><h3>من يرى ماذا</h3><div class="panel-sub">يُحدَّث كل شيء تلقائيًا عند الحفظ، دون أي نشر يدوي.</div>' +
     '<ul class="who-list">' +
     '<li><b>أي زائر:</b> صفحتا الكوادر الطبية (الأسماء والفئات والفروع وتواريخ التراخيص).</li>' +
-    '<li><b>موارد بشرية (يوزر وباسورد):</b> التقارير الشهرية والموظفون والتراخيص والأطباء، بدون رواتب أو أرقام هوية أو جوالات أو بيانات بنكية.</li>' +
+    '<li><b>موارد بشرية (يوزر وباسورد):</b> التقارير الشهرية والموظفون والتراخيص والأطباء والحضور والإجازات، بدون رواتب أو أرقام هوية أو جوالات أو بيانات بنكية.</li>' +
     '<li><b>الأدمن:</b> كل البيانات الكاملة وإدارة البيانات والمستخدمين.</li></ul></div>';
 }
 
@@ -2737,6 +3276,8 @@ RENDERERS.data = function(){
         '<div id="upPreview" style="margin-top:12px"></div></div>' +
       accessCard() +
     '</div>' +
+    syncCardHTML() +
+    attPanelHTML() +
     '<div class="sec-title">تعديل البيانات الرئيسية</div>' +
     (HR_STATE === 'ready' ? '<div class="ds-list" id="dsList"></div><div id="edBox" style="margin-top:14px"></div>'
       : '<div class="empty-state">ستظهر جداول التعديل بعد حفظ أول ملف.</div>') +
@@ -2744,6 +3285,7 @@ RENDERERS.data = function(){
     '<div class="panel"><ol class="steps">' +
       '<li>عدّل خلية أو أضف صفًا من الجداول أعلاه، أو ارفع ملف الإكسل المحدّث ليحل محل كل البيانات.</li>' +
       '<li>بعد الحفظ تتحدّث الصفحات المفتوحة عند الجميع تلقائيًا خلال ثوانٍ، دون إعادة تحميل.</li>' +
+      '<li>مع تفعيل المزامنة التلقائية تصبح ملفات Google هي الأصل: أي رفع أو تعديل يدوي هنا يُستبدل عند أول تعديل لاحق في الملف.</li>' +
     '</ol></div>';
 
   var f = $('#xlFile');
@@ -2754,7 +3296,64 @@ RENDERERS.data = function(){
     ['dragleave', 'drop'].forEach(function(n){ drop.addEventListener(n, function(e){ e.preventDefault(); drop.classList.remove('over'); }); });
     drop.addEventListener('drop', function(e){ var fl = e.dataTransfer && e.dataTransfer.files; if(fl && fl[0]) handleFile(fl[0]); });
   }
+  wireAttPanel();
   if(HR_STATE === 'ready'){ renderDsList(); if(ED) renderEditor(); }
+};
+
+/* ============================================================
+   Attendance page (HR + admin).
+   The dashboard runs inside a sandboxed iframe, so it can reach nothing of the site (no storage, no Firebase).
+   The site sends it DATA.attendance by postMessage; a new version of the data updates the open dashboard in place.
+   ============================================================ */
+var ATT = { frame: null, ready: false, ver: '' };
+
+function attVersion(A){
+  return A ? [A._updatedAt || '', (A.roster || []).length, (A.records || []).length, (A.leave_log || []).length].join('|') : '';
+}
+function attTheme(){
+  var t = document.documentElement.getAttribute('data-theme');
+  return (t === 'dark' || t === 'light') ? t : null;
+}
+function attFit(){
+  var fr = ATT.frame;
+  if(!fr || !document.body.contains(fr)) return;
+  var top = fr.getBoundingClientRect().top;
+  fr.style.height = Math.max(520, window.innerHeight - top - 20) + 'px';
+}
+function attSend(full){
+  var fr = ATT.frame, A = DATA && DATA.attendance;
+  if(!fr || !ATT.ready || !document.body.contains(fr) || !fr.contentWindow || !A) return;
+  var ver = attVersion(A);
+  var msg = { dentera: 'att', type: 'theme', theme: attTheme(), page: cssv('--bg') };
+  if(full || ver !== ATT.ver){ msg.type = 'data'; msg.data = A; ATT.ver = ver; }
+  fr.contentWindow.postMessage(msg, '*');
+}
+
+window.addEventListener('message', function(e){
+  var fr = ATT.frame;
+  if(!fr || e.source !== fr.contentWindow) return;
+  var m = e.data;
+  if(m && m.dentera === 'att' && m.type === 'ready'){ ATT.ready = true; attSend(true); }
+});
+window.addEventListener('resize', attFit);
+
+RENDERERS.attendance = function(){
+  var v = $('#view'), A = DATA && DATA.attendance;
+  if(!A || !Array.isArray(A.roster) || !A.roster.length){
+    ATT.frame = null; ATT.ready = false; ATT.ver = '';
+    var admin = S.role === 'admin';
+    v.innerHTML = '<div class="gate">' + icon('attendance') + '<h2>لا توجد بيانات حضور بعد</h2><p>' +
+      (admin ? 'ارفع ملف الحضور من «إدارة البيانات» لتظهر هذه الصفحة للموارد البشرية.' : 'سيرفع الأدمن بيانات الحضور قريبًا.') + '</p>' +
+      (admin ? '<div class="btn-row" style="justify-content:center;margin-top:14px"><button class="btn" id="gateData">فتح إدارة البيانات</button></div>' : '') + '</div>';
+    var g = $('#gateData'); if(g) g.addEventListener('click', function(){ goTab('data'); });
+    return;
+  }
+  var fr = $('#attFrame');
+  if(fr && fr === ATT.frame){ attSend(false); attFit(); return; }     // same page, new data: update in place
+  v.innerHTML = '<iframe id="attFrame" class="att-frame" title="الحضور والإجازات" sandbox="allow-scripts"></iframe>';
+  ATT.frame = $('#attFrame'); ATT.ready = false; ATT.ver = '';
+  ATT.frame.srcdoc = ATT_FRAME_HTML;
+  attFit();
 };
 
 /* ============================================================
@@ -2877,7 +3476,8 @@ RENDERERS.users = function(){
         '<li>سلّم كل شخص اسمه وكلمة مروره، ويقدر يغيّرها من «حسابي».</li>' +
         '<li>«إيقاف» يمنع الدخول فورًا دون حذف الحساب، و«إزالة» تسحب الصلاحية نهائيًا.</li>' +
         '<li>إذا نسي أحدهم كلمة المرور: احذف حسابه من لوحة Firebase (Authentication ثم Users) ثم أضفه من جديد هنا.</li>' +
-        '<li>الحساب الرئيسي <span dir="ltr">admin</span> يُدار من لوحة Firebase ولا يظهر في هذه القائمة.</li></ul></div>' +
+        '<li>الحساب الرئيسي <span dir="ltr">admin</span> يُدار من لوحة Firebase ولا يظهر في هذه القائمة.</li>' +
+        '<li>المستخدم <span dir="ltr">sync</span> (إن أضفته) تستخدمه المزامنة التلقائية مع Google Sheets؛ لا توقفه ولا تغيّر صلاحيته «أدمن».</li></ul></div>' +
     '</div>' +
     '<div class="sec-title">المستخدمون</div>' +
     '<div class="panel"><div class="table-wrap"><table><thead><tr><th>المستخدم</th><th>الاسم</th><th>الصلاحية</th><th>أُضيف</th><th></th></tr></thead><tbody>' +
@@ -3075,7 +3675,7 @@ async function changePassword(cur, nw){
 }
 
 /* ---------------- private tier ---------------- */
-function stopPrivate(){ if(UNSUB.priv){ try{ UNSUB.priv(); }catch(e){} UNSUB.priv = null; } HR_STATE = 'idle'; }
+function stopPrivate(){ if(UNSUB.priv){ try{ UNSUB.priv(); }catch(e){} UNSUB.priv = null; } HR_STATE = 'idle'; SYNC = null; }
 function startPrivate(){
   stopPrivate();
   if(S.role !== 'hr' && S.role !== 'admin') return;
@@ -3086,7 +3686,9 @@ function startPrivate(){
   }, 15000);
   UNSUB.priv = FB.db.collection(tier).onSnapshot(function(snap){
     clearTimeout(t);
-    var a = assemble(docsOf(snap));
+    var docs = docsOf(snap);
+    SYNC = (S.role === 'admin' && docs.sync) ? docs.sync : null;
+    var a = assemble(docs);
     if(a.state === 'partial') return;
     if(a.state === 'empty'){ DATA = null; HRMETA = null; REPORT = null; HR_STATE = 'empty'; refreshView(); return; }
     if(a.state === 'error'){ HR_STATE = 'error'; HR_ERR = 'البيانات المحفوظة تالفة. ارفع ملف الإكسل من جديد.'; refreshView(); return; }
@@ -3176,6 +3778,7 @@ function saveAll(D, source){
   return enqueue(async function(){
     if(!FB.ok || S.role !== 'admin') throw new Error('الحفظ للأدمن فقط.');
     var counts = {}; DS_KEYS.forEach(function(k){ counts[k] = (D[k] || []).length; });
+    counts.attendance = (D.attendance && D.attendance.records) ? D.attendance.records.length : 0;
     var pub = SR.buildPublic(D, todayISO());
     await writeTier('fin', D, source, counts);
     await writeTier('hr', SR.sanitizeForHr(D), source, counts);
@@ -3195,7 +3798,8 @@ var ROUTES = [
   { id:'workforce', group:'hr', tier:'hr',          hash:'hr-workforce', label:'الموظفون والتصنيفات',    sub:'الأعداد حسب المسمى والقسم والجنسية والجنس' },
   { id:'licenses',  group:'hr', tier:'hr',          hash:'hr-licenses',  label:'التراخيص والتأمين',      sub:'تراخيص وتصنيفات وتأمين الأخطاء الطبية والتنبيهات' },
   { id:'doctors',   group:'hr', tier:'hr',          hash:'hr-doctors',   label:'الأطباء',                sub:'أعداد الأطباء حسب الفرع والتخصص وطريقة الصرف' },
-  { id:'overview',  group:'hr', tier:'admin',       hash:'hr-overview',  label:'نظرة عامة',            sub:'ملخص عام على كامل بيانات الشركة' },
+  { id:'attendance',group:'hr', tier:'hr',          hash:'hr-attendance',label:'الحضور والإجازات',       sub:'الحضور اليومي والالتزام الشهري والإجازات والغياب' },
+  { id:'overview',  group:'hr', tier:'admin',       hash:'hr-overview',  label:'نظرة عامة',           sub:'ملخص عام على كامل بيانات الشركة' },
   { id:'payroll',   group:'hr', tier:'admin',       hash:'hr-payroll',   label:'الرواتب',               sub:'إجمالي الرواتب وتفاصيلها حسب البند والفرع' },
   { id:'contracts', group:'hr', tier:'admin',       hash:'hr-contracts', label:'العقود',                 sub:'العقود المنتهية قريبًا والعقود المنتهية وأنواع العقود' },
   { id:'growth',    group:'hr', tier:'admin',       hash:'hr-growth',    label:'الزيادات والدورات',      sub:'سجل الزيادات الشهرية والدورات التدريبية' },
@@ -3252,7 +3856,7 @@ function updateTopbar(){
   var r = routeById(state.tab) || ROUTES[0];
   $('#viewTitle').textContent = r.label;
   $('#viewSub').textContent = r.sub;
-  var isHr = r.group === 'hr' && S.role === 'admin' && HR_STATE === 'ready';
+  var isHr = r.group === 'hr' && r.id !== 'attendance' && S.role === 'admin' && HR_STATE === 'ready';
   var isMed = r.group === 'medical';
   var sw = $('#searchWrap');
   sw.hidden = !(isHr || isMed);
@@ -3415,7 +4019,8 @@ function boot(){
   if(t){ store('dentera_toast', ''); toast(t); }
   connect();
   window.__SITE__ = { S: S, state: state, goTab: goTab, RENDERERS: RENDERERS,
-    getPUB: function(){ return PUB; }, getDATA: function(){ return DATA; }, getREPORT: function(){ return REPORT; }, charts: CH };
+    getPUB: function(){ return PUB; }, getDATA: function(){ return DATA; }, getREPORT: function(){ return REPORT; }, charts: CH,
+    writeDatasets: writeDatasets };
 }
 if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 
