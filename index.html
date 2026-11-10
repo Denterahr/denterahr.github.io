@@ -1291,11 +1291,26 @@ function isTimePattern(s) {
   return /^\d{1,2}:\d{2}\s*(AM|PM)/i.test(String(s).trim());
 }
 
+// Daily tabs are named by date: "08/11/2026 الأحد". Accepted forms:
+//  - with separators and a 1- or 2-digit day/month ("8/11/2026", "08-11-2026", "8.11.2026")
+//  - the separator-less form an .xlsx export leaves ("08112026"), and its 7-digit variant for a one-digit day
+//    ("8112026"), which is read only when exactly one reading is a valid date.
 function sheetDateFromName(sheetName) {
-  const m = String(sheetName).trim().match(/^(\d{2})(\d{2})(\d{4})/);
-  if (!m) return null;
-  const [, d, mo, y] = m;
-  return `${y}-${mo}-${d}`;
+  const s = String(sheetName).trim();
+  const ok = (d, mo) => d >= 1 && d <= 31 && mo >= 1 && mo <= 12;
+  const out = (y, mo, d) => `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  let m = s.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{4})/);
+  if (m) return ok(+m[1], +m[2]) ? out(m[3], +m[2], +m[1]) : null;
+  m = s.match(/^(\d{2})(\d{2})(\d{4})(?!\d)/);
+  if (m) return out(m[3], +m[2], +m[1]);
+  m = s.match(/^(\d{3})(\d{4})(?!\d)/);
+  if (m) {
+    const a = [+m[1][0], +m[1].slice(1)], b = [+m[1].slice(0, 2), +m[1][2]];   // day+MM, or DD+month
+    const va = ok(a[0], a[1]), vb = ok(b[0], b[1]);
+    if (va && !vb) return out(m[2], a[1], a[0]);
+    if (vb && !va) return out(m[2], b[1], b[0]);
+  }
+  return null;
 }
 
 // Parse one daily sheet (2-row-per-employee blocks, grouped by department header rows)
@@ -1470,8 +1485,8 @@ function parseSummarySheet(rows, knownDates) {
 // Main entry: takes a SheetJS workbook, returns the unified dataset shape used by the dashboard.
 function parseAttendanceWorkbook(wb) {
   const sheetNames = wb.SheetNames;
-  const dailySheetNames = sheetNames.filter(n => /^\d{8}/.test(n.trim()));
-  const otherSheetNames = sheetNames.filter(n => !/^\d{8}/.test(n.trim()));
+  const dailySheetNames = sheetNames.filter(n => sheetDateFromName(n) !== null);
+  const otherSheetNames = sheetNames.filter(n => sheetDateFromName(n) === null);
 
   const dailyEmployees = {};
   let allRecords = [];
