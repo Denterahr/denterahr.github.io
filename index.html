@@ -1051,9 +1051,11 @@ function isSaudi(n){ return /^saudi/i.test(n || '') || /سعود/.test(n || '');
    ratio = weighted Saudis / (weighted Saudis + non-GCC expatriates) x 100
    Saudi (and GCC citizens, who are not expatriates): weight 1 when the GOSI wage (basic + housing) reaches the full
    threshold, 0.5 from one thousand below it, 0 under that. Thresholds: 4,000 now, 5,000 from 25 Apr 2027, 6,000 from 25 Apr 2028.
-   Every other nationality counts 1. Only employees on a documented (Qiwa) contract are counted. */
+   Every other nationality counts 1. Only employees on a documented (Qiwa) contract are counted, and a Saudi counts only when
+   registered with GOSI (the file shows no GOSI deduction for him = not registered = left out of both sides). */
 var NITAQAT_FULL = [['2000-01-01', 4000], ['2027-04-25', 5000], ['2028-04-25', 6000]];
 var BAND_EDGES = [6000, 5000, 4000, 3000, 0];
+var NO_GOSI = -1;                                       /* band value for a Saudi with no GOSI registration */
 var GCC_RE = /kuwait|emirat|\buae\b|bahrain|\bomani|qatar|كويت|إمارات|اماراتي|إماراتي|بحرين|عمان|قطر/i;
 function isGcc(n){ return GCC_RE.test(n || ''); }
 function countsAsSaudi(n){ return isSaudi(n) || isGcc(n); }
@@ -1076,6 +1078,7 @@ function wageBand(w){
 function rowBand(r){
   if(!r) return null;
   if(typeof r.nitaqat_band === 'number') return r.nitaqat_band;
+  if(typeof r.gosi === 'number' && r.gosi <= 0) return NO_GOSI;
   var b = (typeof r.basic === 'number' ? r.basic : 0) + (typeof r.housing === 'number' ? r.housing : 0);
   if(b > 0) return wageBand(b);
   if(typeof r.total === 'number' && r.total > 0) return wageBand(r.total * 25 / 27);
@@ -1087,15 +1090,17 @@ function nitaqatWeight(band, asOf){
   return band >= full ? 1 : (band >= full - 1000 ? 0.5 : 0);
 }
 function nitaqat(rows, asOf){
-  var sw = 0, sn = 0, ex = 0, half = 0, none = 0;
+  var sw = 0, sn = 0, ex = 0, half = 0, none = 0, ng = 0;
   (rows || []).forEach(function(r){
     if(countsAsSaudi(r.nationality)){
-      var w = nitaqatWeight(rowBand(r), asOf);
+      var b = rowBand(r);
+      if(b === NO_GOSI){ ng++; return; }
+      var w = nitaqatWeight(b, asOf);
       sn++; sw += w; if(w === 0.5) half++; else if(w === 0) none++;
     } else ex++;
   });
   var base = sw + ex;
-  return { full: nitaqatFull(asOf), saudi_n: sn, saudi_w: sw, expat_n: ex, base_n: sn + ex, half_n: half, none_n: none,
+  return { full: nitaqatFull(asOf), saudi_n: sn, saudi_w: sw, expat_n: ex, base_n: sn + ex, half_n: half, none_n: none, nogosi_n: ng,
     ratio: base ? Math.round(sw / base * 1000) / 10 : 0 };
 }
 
@@ -1132,13 +1137,13 @@ function timeline(d, cur){
   var deptOf = (global.DenteraExtract && global.DenteraExtract.deptOf) || function(){ return 'أخرى'; };
   var P = [];
   (d.employees || []).forEach(function(e){
-    P.push({ s: ymOf(e.start) || '1900-01', x: null, sa: isSaudi(e.nationality), nq: countsAsSaudi(e.nationality), band: rowBand(e), dept: e.department || 'أخرى', pay: e.total || 0, active: true });
+    P.push({ s: ymOf(e.start) || '1900-01', x: null, sa: isSaudi(e.nationality), nq: countsAsSaudi(e.nationality), band: countsAsSaudi(e.nationality) ? rowBand(e) : null, dept: e.department || 'أخرى', pay: e.total || 0, active: true });
   });
   (d.end_contracts || []).forEach(function(x){
     var s = ymOf(x.start);
     var xe = exitMonth(x, cur);
     if(!xe) return;
-    P.push({ s: s || '1900-01', x: xe, sa: isSaudi(x.nationality), nq: countsAsSaudi(x.nationality), band: rowBand(x), dept: deptOf(x.job_title) || 'أخرى',
+    P.push({ s: s || '1900-01', x: xe, sa: isSaudi(x.nationality), nq: countsAsSaudi(x.nationality), band: countsAsSaudi(x.nationality) ? rowBand(x) : null, dept: deptOf(x.job_title) || 'أخرى',
       reason: reasonGroup(x.reason), pay: x.total || 0, eos: x.amount || 0, active: false, startKnown: !!s });
   });
   return P;
@@ -1172,7 +1177,7 @@ function buildReport(d, todayISO, staff){
       row.saudi = here.filter(function(p){ return p.sa; }).length;
       /* Nitaqat ratio: weighted Saudis / (weighted Saudis + expatriates); the threshold is the one in force that month */
       var nqW = 0, nqEx = 0;
-      here.forEach(function(p){ if(p.nq) nqW += nitaqatWeight(p.band, ym + '-15'); else nqEx++; });
+      here.forEach(function(p){ if(p.nq){ if(p.band !== NO_GOSI) nqW += nitaqatWeight(p.band, ym + '-15'); } else nqEx++; });
       row.saudi_w = nqW;
       row.saudi_pct = (nqW + nqEx) ? round1(nqW / (nqW + nqEx) * 100) : 0;
       row.hires = hires.length;
@@ -2093,7 +2098,7 @@ RENDERERS.overview = function(){
       '<div class="kpi"><div class="kpi-label">إجمالي الموظفين</div><div class="kpi-value">'+fmtNum(TOTAL_HEADCOUNT)+'</div><div class="kpi-note">عقد أساسي ('+fmtNum(EMP.length)+') + عقود أخرى ('+fmtNum(OC.length)+') — لا يشمل المتدربين</div></div>'+
       '<div class="kpi" style="border-inline-start-color:var(--tooth)"><div class="kpi-label">المتدربون (تمهير)</div><div class="kpi-value">'+fmtNum(TRAINEES.length)+'</div><div class="kpi-note">قسم مستقل — راجع تبويب العقود</div></div>'+
       '<div class="kpi c-accent"><div class="kpi-label">عدد الأطباء</div><div class="kpi-value">'+fmtNum(DOCM.length)+'</div><div class="kpi-note">منهم '+fmtNum(pctDoctors)+' على نظام النسبة الشهرية</div></div>'+
-      '<div class="kpi c-ok"><div class="kpi-label">نسبة التوطين (نطاقات)</div><div class="kpi-value">'+fmtNum(NQ.ratio, 1)+'<small>%</small></div>'+'<div class="kpi-note">'+fmtNum(NQ.saudi_w, 1)+' محتسب من '+fmtNum(NQ.saudi_w + NQ.expat_n, 1)+' · عقود قوى فقط</div></div>'+
+      '<div class="kpi c-ok"><div class="kpi-label">نسبة التوطين (نطاقات)</div><div class="kpi-value">'+fmtNum(NQ.ratio, 1)+'<small>%</small></div>'+'<div class="kpi-note">'+fmtNum(NQ.saudi_w, 1)+' محتسب من '+fmtNum(NQ.saudi_w + NQ.expat_n, 1)+' · عقود قوى فقط'+(NQ.nogosi_n ? ' · غير محسوب: '+fmtNum(NQ.nogosi_n)+' سعودي بلا تأمينات' : '')+'</div></div>'+
       '<div class="kpi c-danger"><div class="kpi-label">تنبيهات تحتاج متابعة</div><div class="kpi-value">'+fmtNum(ALERTS.length)+'</div><div class="kpi-note">تراخيص، تأمين، وعقود قريبة الانتهاء</div></div>'+
     '</div>'+
 
@@ -2246,7 +2251,7 @@ RENDERERS.workforce = function(){
     '<div class="kpi-row">'+
       '<div class="kpi"><div class="kpi-label">إجمالي الموظفين (كل الأنواع)</div><div class="kpi-value">'+fmtNum(TOTAL_HEADCOUNT)+'</div></div>'+
       '<div class="kpi c-ok"><div class="kpi-label">ذكور / إناث (العقود الأساسية)</div><div class="kpi-value">'+fmtNum(maleCount)+' <small>/</small> '+fmtNum(femaleCount)+'</div></div>'+
-      '<div class="kpi c-accent"><div class="kpi-label">نسبة التوطين (نطاقات)</div><div class="kpi-value">'+fmtNum(NQ.ratio, 1)+'<small>%</small></div>'+'<div class="kpi-note">'+fmtNum(NQ.saudi_w, 1)+' محتسب من '+fmtNum(NQ.saudi_w + NQ.expat_n, 1)+' · عقود قوى فقط</div></div>'+
+      '<div class="kpi c-accent"><div class="kpi-label">نسبة التوطين (نطاقات)</div><div class="kpi-value">'+fmtNum(NQ.ratio, 1)+'<small>%</small></div>'+'<div class="kpi-note">'+fmtNum(NQ.saudi_w, 1)+' محتسب من '+fmtNum(NQ.saudi_w + NQ.expat_n, 1)+' · عقود قوى فقط'+(NQ.nogosi_n ? ' · غير محسوب: '+fmtNum(NQ.nogosi_n)+' سعودي بلا تأمينات' : '')+'</div></div>'+
       '<div class="kpi"><div class="kpi-label">عدد الأقسام</div><div class="kpi-value">'+fmtNum(deptCount)+'</div></div>'+
       '<div class="kpi"><div class="kpi-label">عدد المسميات الوظيفية</div><div class="kpi-value">'+fmtNum(titleCount)+'</div></div>'+
     '</div>'+
@@ -2260,7 +2265,7 @@ RENDERERS.workforce = function(){
     el.addEventListener('click', function(){ state.wfSub = el.getAttribute('data-sub'); RENDERERS.workforce(); });
   });
   var entries = wfEntries(state.wfSub);
-  $('#wfBody').innerHTML = (state.wfSub==='nat' ? '<div class="note-box">الأطباء بعقود جزئية ('+fmtNum(PT_DOC_N)+') غير محسوبين في هذه القائمة.<br>نسبة التوطين تُحسب بطريقة «نطاقات المطوّر»: السعودي = 1 إذا كان أجره الخاضع للتأمينات (الأساسي + السكن) '+fmtNum(NQ.full)+' ريال فأكثر، و0.5 إذا كان بين '+fmtNum(NQ.full - 1000)+' وأقل من '+fmtNum(NQ.full)+'، وإلا لا يُحتسب؛ وغير السعودي = 1. العدّ على موظفي عقود قوى فقط (بدون الأطباء بعقود جزئية وعمالة أجير والتشغيل الخارجي والدوام الجزئي)، ولحظة اليوم بينما النظام الرسمي يعتمد متوسط الأشهر.'+(NQ27.full !== NQ.full ? '<br>تنبيه: الحد الرسمي يرتفع إلى '+fmtNum(NQ27.full)+' ريال من 25 أبريل 2027، وبنفس الموظفين الحاليين تصير النسبة '+fmtNum(NQ27.ratio, 1)+'%.' : '')+'</div>' : '') + barListHTML(entries, {showShare:true});
+  $('#wfBody').innerHTML = (state.wfSub==='nat' ? '<div class="note-box">الأطباء بعقود جزئية ('+fmtNum(PT_DOC_N)+') غير محسوبين في هذه القائمة.<br>نسبة التوطين تُحسب بطريقة «نطاقات المطوّر»: السعودي = 1 إذا كان أجره الخاضع للتأمينات (الأساسي + السكن) '+fmtNum(NQ.full)+' ريال فأكثر، و0.5 إذا كان بين '+fmtNum(NQ.full - 1000)+' وأقل من '+fmtNum(NQ.full)+'، وإلا لا يُحتسب؛ وغير السعودي = 1. ويُشترط أن يكون السعودي مسجلًا بالتأمينات (عليه خصم تأمينات في الملف)، وغير المسجلين ('+fmtNum(NQ.nogosi_n)+') خارج الحساب. العدّ على موظفي عقود قوى فقط (بدون الأطباء بعقود جزئية وعمالة أجير والتشغيل الخارجي والدوام الجزئي)، ولحظة اليوم بينما النظام الرسمي يعتمد متوسط الأشهر.'+(NQ27.full !== NQ.full ? '<br>تنبيه: الحد الرسمي يرتفع إلى '+fmtNum(NQ27.full)+' ريال من 25 أبريل 2027، وبنفس الموظفين الحاليين تصير النسبة '+fmtNum(NQ27.ratio, 1)+'%.' : '')+'</div>' : '') + barListHTML(entries, {showShare:true});
 };
 
 /* ============================================================
